@@ -6,7 +6,8 @@ request_logs 没有 switches/stream_phase），然后用当前代码执行 init_
 
   1. 表结构自动补齐（ALTER TABLE，不删库）
   2. 站点 / API Key / 路由 / 上游模型名 一条不丢
-  3. 旧的 routes.model 自动补齐成统一模型记录
+  3. 旧的 routes.model 自动补齐成统一模型记录，并且能区分
+     「手工建的统一模型」和「导入模型时自动生成的分组」
 
 用法： python3 tests/smoke_db.py
 """
@@ -85,15 +86,22 @@ assert routes[0]["priority"] == 100, "新列默认值不对"
 groups = {r["name"] for r in db.query("SELECT name FROM model_groups")}
 assert groups == {"auto", "gpt-5"}, f"统一模型没补齐: {sorted(groups)}"
 
+# 3.1 必须能区分「手工建的统一模型」和「导入模型自动生成的分组」
+g = {r["name"]: r for r in db.query("SELECT * FROM model_groups")}
+assert g["auto"]["auto"] == 0, "绑过真实模型名的分组应保留为手工创建"
+assert g["auto"]["is_public"] == 1, "手工建的分组应保持对外可见"
+assert g["gpt-5"]["auto"] == 1, "纯粹由导入产生的分组应被标记成自动生成"
+assert g["gpt-5"]["is_public"] == 0, "自动生成的分组默认不应对外公开"
+
 # 4. 再跑一次必须幂等
 db.init_db()
 assert len(db.query("SELECT * FROM routes")) == 2
 assert len(db.query("SELECT * FROM model_groups")) == 2, "重复初始化产生了重复记录"
 
-# 5. 公开模型列表
+# 5. 公开模型列表：只应有手工建的那一个，导入进来的不该刷屏
 from app import engine  # noqa: E402
 pub = engine.public_models()
-assert pub == ["auto", "gpt-5"], f"public_models 不对: {pub}"
+assert pub == ["auto"], f"public_models 不对: {pub}"
 
 print(f"OK 旧库升级：站点 {len(sites)} / 路由 {len(routes)} / "
       f"统一模型 {sorted(groups)} / 对外模型 {pub}")

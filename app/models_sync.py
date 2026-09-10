@@ -92,6 +92,9 @@ def import_models(items, daily_limit=0):
                VALUES (?, ?, '', 1, ?)""",
             (site_id, model, int(daily_limit or 0)),
         )
+        # 顺手建一条「自动生成」的统一模型记录（默认不对外公开）。
+        # 这些模型仍然可以按原名直接请求，但不会污染 /v1/models 和统一模型页。
+        db.ensure_group(model, auto=1, is_public=0)
         added += 1
     return added
 

@@ -1155,30 +1155,50 @@ function importCfg(input) {
 let CUR_GROUP = null;
 let SITE_MODELS = {};
 
+let SHOW_AUTO = false;
+
+function groupRow(g) {
+  const live = g.live_nodes > 0
+    ? `<span class="tag ok">${g.live_nodes} 个可用节点</span>`
+    : '<span class="tag err">无可用节点</span>';
+  return `<tr>
+    <td style="width:34px"><input type="checkbox" class="gpick" data-name="${esc(g.name)}"
+      onchange="updateGroupCount()"></td>
+    <td><b class="mono" style="font-size:13px">${esc(g.name)}</b>${
+      g.display ? `<br><span class="muted">${esc(g.display)}</span>` : ''}</td>
+    <td>${live}${g.enabled ? '' : ' <span class="tag dim">已停用</span>'}${
+      g.is_public ? ' <span class="tag acc">对外可见</span>' : ' <span class="tag dim">仅内部</span>'}</td>
+    <td>${g.nodes}</td>
+    <td class="mono">${esc(g.strategy || '继承全局')}</td>
+    <td class="muted" style="max-width:150px">${esc(g.note || '')}</td>
+    <td class="nowrap">
+      <button class="sm primary" onclick="openGroup('${jsq(g.name)}')">管理节点</button>
+      <button class="sm" onclick="editGroup('${jsq(g.name)}')">编辑</button>
+      <button class="sm danger" onclick="delGroup('${jsq(g.name)}', ${g.nodes})">删除</button>
+    </td></tr>`;
+}
+
+function batchBar() {
+  return `
+    <div class="batch">
+      <label class="model" style="padding:5px 12px">
+        <input type="checkbox" class="pick-all" onchange="pickAllGroups(this.checked)"> 全选本页</label>
+      <span class="muted">已选 <b class="g-count">0</b> 个</span>
+      <button class="sm" onclick="batchGroups('enable')">批量启用</button>
+      <button class="sm" onclick="batchGroups('disable')">批量停用</button>
+      <button class="sm" onclick="batchGroups('public')">设为对外可见</button>
+      <button class="sm" onclick="batchGroups('private')">设为仅内部</button>
+      <button class="sm danger" onclick="batchGroups('delete')">批量删除</button>
+    </div>`;
+}
+
 RENDER.groups = async function () {
   const el = $('#tab-groups');
   try {
     SITES = await api('/sites');
     const gs = await api('/groups');
-    const rows = gs.map(g => {
-      const live = g.live_nodes > 0
-        ? `<span class="tag ok">${g.live_nodes} 个可用节点</span>`
-        : '<span class="tag err">无可用节点</span>';
-      return `<tr>
-        <td><b class="mono" style="font-size:13px">${esc(g.name)}</b>${
-          g.display ? `<br><span class="muted">${esc(g.display)}</span>` : ''}</td>
-        <td>${live}${g.enabled ? '' : ' <span class="tag dim">已停用</span>'}${
-          g.is_public ? ' <span class="tag acc">对外可见</span>' : ' <span class="tag dim">仅内部</span>'}</td>
-        <td>${g.nodes}</td>
-        <td class="mono">${esc(g.strategy || '继承全局')}</td>
-        <td class="muted" style="max-width:180px">${esc(g.note || '')}</td>
-        <td class="nowrap">
-          <button class="sm primary" onclick="openGroup('${jsq(g.name)}')">管理节点</button>
-          <button class="sm" onclick="editGroup('${jsq(g.name)}')">编辑</button>
-          <button class="sm danger" onclick="delGroup('${jsq(g.name)}', ${g.nodes})">删除</button>
-        </td></tr>`;
-    }).join('');
-
+    const manual = gs.filter(g => !g.auto);
+    const autoGs = gs.filter(g => g.auto);
     el.innerHTML = `
       <div class="card glass">
         <div class="card-head"><h2>统一模型是什么</h2></div>
@@ -1192,14 +1212,33 @@ RENDER.groups = async function () {
       </div>
       <div class="card glass">
         <div class="card-head">
-          <h2>统一模型（${gs.length}）</h2>
+          <h2>我建的统一模型（${manual.length}）</h2>
           <button class="primary" onclick="newGroup()">新建统一模型</button>
         </div>
+        ${manual.length ? batchBar() : ''}
         <div class="scroll"><table>
-          <thead><tr><th>统一模型名</th><th>状态</th><th>节点数</th><th>策略</th><th>备注</th><th>操作</th></tr></thead>
-          <tbody>${rows || '<tr><td colspan="6" class="empty">还没有统一模型。点右上角新建一个，名字例如 auto</td></tr>'}</tbody>
+          <thead><tr><th></th><th>统一模型名</th><th>状态</th><th>节点数</th><th>策略</th><th>备注</th><th>操作</th></tr></thead>
+          <tbody>${manual.map(groupRow).join('')
+            || '<tr><td colspan="7" class="empty">还没有统一模型。点右上角新建一个，名字例如 auto</td></tr>'}</tbody>
         </table></div>
+      </div>
+      <div class="card glass">
+        <div class="card-head">
+          <h2>导入模型时自动生成的分组（${autoGs.length}）</h2>
+          <button class="ghost sm" onclick="toggleAutoGroups()">${SHOW_AUTO ? '收起' : '展开查看'}</button>
+        </div>
+        <div class="note" style="margin-bottom:12px">
+          这些<b>不是</b>统一模型，只是「你导入过哪些模型」的记录。
+          它们默认<b>不出现在 <code>/v1/models</code> 里</b>，也不参与任何路由决策。<br>
+          想让某个模型变成客户端能直接请求的，勾上「设为对外可见」即可。
+        </div>
+        ${SHOW_AUTO ? (batchBar() + `<div class="scroll"><table>
+          <thead><tr><th></th><th>模型名</th><th>状态</th><th>节点数</th><th>策略</th><th>备注</th><th>操作</th></tr></thead>
+          <tbody>${autoGs.map(groupRow).join('')
+            || '<tr><td colspan="7" class="empty">没有</td></tr>'}</tbody>
+        </table></div>`) : ''}
       </div>`;
+    updateGroupCount();
   } catch (e) { el.innerHTML = `<div class="card glass empty">加载失败：${esc(e.message)}</div>`; }
 };
 
@@ -1208,6 +1247,43 @@ function nodeStateTag(n) {
   if (n.state === 'disabled') return '<span class="tag dim">已停用</span>';
   if (n.state === 'error') return '<span class="tag err">最近失败</span>';
   return '<span class="tag ok">正常</span>';
+}
+
+function toggleAutoGroups() { SHOW_AUTO = !SHOW_AUTO; RENDER.groups(); }
+
+/* ---- 统一模型批量操作 ---- */
+
+function groupBoxes() { return $$('#tab-groups .gpick'); }
+
+function pickedGroupNames() {
+  return groupBoxes().filter(cb => cb.checked).map(cb => cb.dataset.name);
+}
+
+function updateGroupCount() {
+  const n = pickedGroupNames().length;
+  $$('#tab-groups .g-count').forEach(e => { e.textContent = n; });
+  const all = groupBoxes();
+  $$('#tab-groups .pick-all').forEach(pa => {
+    pa.checked = all.length > 0 && n === all.length;
+    pa.indeterminate = n > 0 && n < all.length;
+  });
+}
+
+function pickAllGroups(on) {
+  groupBoxes().forEach(cb => { cb.checked = on; });
+  updateGroupCount();
+}
+
+async function batchGroups(action) {
+  const names = pickedGroupNames();
+  if (!names.length) return toast('先勾选要操作的分组', 'err');
+  if (action === 'delete' && !confirm(
+    `删除这 ${names.length} 个分组？\n它们的节点（也就是路由）会一起删掉。\n\n站点本身不受影响。`)) return;
+  try {
+    const r = await api('/groups/batch', { method: 'POST', body: JSON.stringify({ names, action }) });
+    toast(`已处理 ${r.affected} 个`, 'ok');
+    RENDER.groups();
+  } catch (e) { toast(e.message, 'err'); }
 }
 
 function newGroup() {

@@ -822,7 +822,7 @@ def _node_dict(row, now):
 async def list_groups(request: Request):
     require_admin(request)
     out = []
-    for row in db.query("SELECT * FROM model_groups ORDER BY name"):
+    for row in db.query("SELECT * FROM model_groups ORDER BY auto, name"):
         g = db.rowdict(row)
         n = db.query_one("SELECT COUNT(*) AS n FROM routes WHERE model=?", (g["name"],))
         live = db.query_one(
@@ -832,6 +832,9 @@ async def list_groups(request: Request):
         g["live_nodes"] = int(live["n"]) if live else 0
         g["is_public"] = int(g["is_public"])
         g["enabled"] = int(g["enabled"])
+        # auto=1 表示「跟着导入的模型自动生成的」，不是用户手工建的。
+        # 前端默认把它折叠起来，免得被几百个模型名刷屏。
+        g["auto"] = int(g.get("auto") or 0)
         out.append(g)
     return out
 
@@ -845,8 +848,9 @@ async def create_group(request: Request, payload: dict = Body(...)):
     if _group_row(name):
         raise HTTPException(400, f"统一模型 {name} 已存在")
     db.execute(
-        """INSERT INTO model_groups(name, display, enabled, is_public, strategy, note, created_at)
-           VALUES (?,?,?,?,?,?,?)""",
+        """INSERT INTO model_groups
+           (name, display, enabled, is_public, strategy, note, created_at, auto)
+           VALUES (?,?,?,?,?,?,?,0)""",
         (name, str(payload.get("display") or ""),
          1 if payload.get("enabled", True) else 0,
          1 if payload.get("is_public", True) else 0,
@@ -885,6 +889,8 @@ async def update_group(name: str, request: Request, payload: dict = Body(...)):
     if "is_public" in payload:
         fields.append("is_public=?")
         values.append(1 if payload["is_public"] else 0)
+    # 用户手动改过之后，它就不再算「自动生成」的了
+    fields.append("auto=0")
     if not fields:
         return {"ok": True}
     values.append(name)
@@ -1201,6 +1207,7 @@ async def update_route(route_id: int, request: Request, payload: dict = Body(...
 async def delete_route(route_id: int, request: Request):
     require_admin(request)
     db.execute("DELETE FROM routes WHERE id=?", (route_id,))
+    db.purge_empty_auto_groups()
     return {"ok": True}
 
 
@@ -1229,7 +1236,9 @@ async def batch_routes(request: Request, payload: dict = Body(...)):
 
     if action == "delete":
         cur = db.execute(f"DELETE FROM routes WHERE id IN ({marks})", ids)
-        return {"ok": True, "action": action, "affected": cur.rowcount}
+        purged = db.purge_empty_auto_groups()
+        return {"ok": True, "action": action, "affected": cur.rowcount,
+                "purged_groups": purged}
     if action in ("enable", "disable"):
         cur = db.execute(
             f"UPDATE routes SET enabled=? WHERE id IN ({marks})",
@@ -1241,6 +1250,47 @@ async def batch_routes(request: Request, payload: dict = Body(...)):
             [int(payload.get("value") or 0)] + ids)
         return {"ok": True, "action": action, "affected": cur.rowcount}
     raise HTTPException(400, "不支持的批量操作（只支持 delete / enable / disable / limit）")
+
+
+@app.post("/admin/api/groups/batch")
+async def batch_groups(request: Request, payload: dict = Body(...)):
+    """统一模型批量操作：delete / enable / disable / public / private
+
+    delete 会连带删掉它的节点（节点本来就是路由）。
+    """
+    require_admin(request)
+    names = [str(n).strip() for n in (payload.get("names") or []) if str(n).strip()]
+    if not names:
+        raise HTTPException(400, "没有选择任何统一模型")
+    if len(names) > 2000:
+        raise HTTPException(400, "一次最多操作 2000 条")
+
+    action = str(payload.get("action") or "").strip()
+    marks = ",".join("?" * len(names))
+
+    if action == "delete":
+        db.execute(f"DELETE FROM routes WHERE model IN ({marks})", names)
+        cur = db.execute(f"DELETE FROM model_groups WHERE name IN ({marks})", names)
+        return {"ok": True, "action": action, "affected": cur.rowcount}
+    if action in ("enable", "disable"):
+        cur = db.execute(
+            f"UPDATE model_groups SET enabled=? WHERE name IN ({marks})",
+            [1 if action == "enable" else 0] + names)
+        return {"ok": True, "action": action, "affected": cur.rowcount}
+    if action in ("public", "private"):
+        cur = db.execute(
+            f"UPDATE model_groups SET is_public=? WHERE name IN ({marks})",
+            [1 if action == "public" else 0] + names)
+        return {"ok": True, "action": action, "affected": cur.rowcount}
+    raise HTTPException(
+        400, "不支持的批量操作（delete / enable / disable / public / private）")
+
+
+@app.post("/admin/api/groups/purge-empty")
+async def purge_empty_groups(request: Request):
+    """清理「自动生成、且已经没有任何节点」的统一模型空壳。"""
+    require_admin(request)
+    return {"ok": True, "removed": db.purge_empty_auto_groups()}
 
 
 # -------- API Key

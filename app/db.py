@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS model_groups (
   is_public   INTEGER NOT NULL DEFAULT 1,
   strategy    TEXT    NOT NULL DEFAULT '',
   note        TEXT    NOT NULL DEFAULT '',
-  created_at  REAL    NOT NULL DEFAULT 0
+  created_at  REAL    NOT NULL DEFAULT 0,
+  auto        INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS routes (
@@ -180,6 +181,9 @@ MIGRATIONS = {
         "last_latency_ms": "INTEGER NOT NULL DEFAULT 0",
         "circuit_until": "REAL NOT NULL DEFAULT 0",
     },
+    "model_groups": {
+        "auto": "INTEGER NOT NULL DEFAULT 0",
+    },
 }
 
 
@@ -263,22 +267,71 @@ def _migrate_settings():
         set_setting("auto_sync_models", False)
         set_setting("_mig_auto_sync_off", True)
     sync_groups()
+    backfill_group_origin()
+
+
+def ensure_group(name, auto=1, is_public=0):
+    """确保存在一条统一模型记录；已经有了就完全不动（绝不覆盖用户设置）。"""
+    name = (name or "").strip()
+    if not name:
+        return
+    if query_one("SELECT 1 FROM model_groups WHERE name=?", (name,)) is None:
+        execute(
+            """INSERT INTO model_groups
+               (name, display, enabled, is_public, strategy, note, created_at, auto)
+               VALUES (?, '', 1, ?, '', '', ?, ?)""",
+            (name, int(bool(is_public)), time.time(), int(bool(auto))),
+        )
 
 
 def sync_groups():
-    """为每个已存在的 routes.model 补齐一条统一模型记录。
+    """给每个 routes.model 补一条统一模型记录（auto=1，默认不对外公开）。
 
-    旧库升级到本版本时自动执行，保证已经配好的模型不会从 /v1/models 里消失。
-    只新增，绝不删除用户手工建的统一模型。
+    auto=1 表示「跟着路由自动生成的，不是用户手工建的」。
+    这类分组默认 is_public=0 —— 不会出现在 /v1/models 里，
+    免得把上游几百个模型名一股脑怼给客户端。
+    想公开的话，在「统一模型」页一键切换即可。
     """
-    now = time.time()
     for row in query("SELECT DISTINCT model FROM routes"):
         name = (row["model"] or "").strip()
         if not name:
             continue
-        if query_one("SELECT 1 FROM model_groups WHERE name=?", (name,)) is None:
-            execute(
-                """INSERT INTO model_groups(name, display, enabled, is_public, strategy, note, created_at)
-                   VALUES (?, '', 1, 1, '', '', ?)""",
-                (name, now),
-            )
+        nodes = query("SELECT upstream_model FROM routes WHERE model=?", (name,))
+        # 只要有一个节点绑了真实模型名，就说明这是用户手工建的跨站统一模型
+        manual = any((r["upstream_model"] or "").strip() for r in nodes)
+        ensure_group(name, auto=0 if manual else 1, is_public=1 if manual else 0)
+
+
+def purge_empty_auto_groups():
+    """清掉「自动生成、且已经没有任何节点」的分组。
+
+    删完路由后不留空壳，否则统一模型页会攒一堆点进去是空的条目。
+    """
+    cur = execute(
+        """DELETE FROM model_groups
+           WHERE auto=1 AND name NOT IN (SELECT DISTINCT model FROM routes)"""
+    )
+    return cur.rowcount
+
+
+def backfill_group_origin():
+    """把老库里「自动生成的分组」认出来并标记（只做一次）。
+
+    判断依据：该分组下所有节点的 upstream_model 都是空的 —— 说明它只是
+    「导入某个模型」的副产品，不是用户手工绑的跨站统一模型。
+    这类分组改成 auto=1 + is_public=0，从「统一模型」页默认视图和 /v1/models 里挪走。
+    绑过真实模型名的分组一律原样保留，所以你手工建的 auto 不会被误伤。
+    """
+    if get_setting("_mig_group_origin") is not None:
+        return
+    for row in query("SELECT name FROM model_groups"):
+        name = row["name"]
+        nodes = query("SELECT upstream_model FROM routes WHERE model=?", (name,))
+        if not nodes:
+            continue  # 空分组，可能是刚建的，不动
+        if any((r["upstream_model"] or "").strip() for r in nodes):
+            # 绑过真实模型名 -> 用户手工建的跨站统一模型，保持原样（公开）
+            execute("UPDATE model_groups SET auto=0, is_public=1 WHERE name=?", (name,))
+            continue
+        execute("UPDATE model_groups SET auto=1, is_public=0 WHERE name=?", (name,))
+    set_setting("_mig_group_origin", True)

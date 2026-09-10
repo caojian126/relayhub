@@ -361,6 +361,39 @@ def main():
     check("auto_sync_models 默认是关的（不会不打招呼就把上游模型全导入）",
           st == 200 and s.get("auto_sync_models") is False, s.get("auto_sync_models"))
 
+    print("\n=== 14. 统一模型：自动生成的分组默认不对外 ===", flush=True)
+    st, gs = admin("/groups")
+    amap = {g["name"]: g for g in gs}
+    check("导入产生的分组被标记成自动生成(auto=1)",
+          amap.get("gpt-5", {}).get("auto") == 1,
+          {k: v.get("auto") for k, v in amap.items()})
+    check("自动生成的分组默认不公开(is_public=0)",
+          amap.get("gpt-5", {}).get("is_public") == 0,
+          amap.get("gpt-5", {}).get("is_public"))
+    check("手工建的分组 auto=0 且对外可见",
+          amap.get("auto", {}).get("auto") == 0 and amap.get("auto", {}).get("is_public") == 1,
+          {k: (v.get("auto"), v.get("is_public")) for k, v in amap.items()})
+
+    r = gw("/models", "GET")
+    ids_out = [m["id"] for m in r.json().get("data", [])]
+    check("/v1/models 不含自动生成的分组（不再刷屏）", "gpt-5" not in ids_out, ids_out)
+    check("/v1/models 含手工建的分组", "auto" in ids_out, ids_out)
+
+    st, r = admin("/groups/batch", "POST", {"names": ["gpt-5"], "action": "public"})
+    check("批量设为对外可见", st == 200 and r.get("affected") == 1, r)
+    r = gw("/models", "GET")
+    check("公开后确实出现在 /v1/models",
+          "gpt-5" in [m["id"] for m in r.json().get("data", [])])
+
+    st, r = admin("/groups/batch", "POST", {"names": ["gpt-5", "gpt-5-mini"], "action": "disable"})
+    check("批量停用", st == 200 and r.get("affected") == 2, r)
+    st, r = admin("/groups/batch", "POST", {"names": [], "action": "delete"})
+    check("空 names 被拒绝", st == 400, st)
+    st, r = admin("/groups/batch", "POST", {"names": ["gpt-5"], "action": "delete"})
+    check("批量删除分组（连带删节点）", st == 200 and r.get("affected") == 1, r)
+    st, rs = admin("/routes")
+    check("节点确实被一起删掉了", "gpt-5" not in [x["model"] for x in rs])
+
     print("\n" + "=" * 56, flush=True)
     if FAILED:
         print(f"结果：{len(FAILED)} 项失败", flush=True)
