@@ -10,8 +10,8 @@ from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 
-from . import db, engine, fileconfig, models_sync, quota, security
-from .config import CONFIG_PATH, CONNECT_TIMEOUT, REQUEST_TIMEOUT
+from . import db, engine, models_sync, quota, security
+from .config import CONNECT_TIMEOUT, REQUEST_TIMEOUT
 from .db import DEFAULT_SETTINGS
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -38,7 +38,7 @@ async def lifespan(app: FastAPI):
         await app.state.client.aclose()
 
 
-app = FastAPI(title="RelayHub", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="RelayHub", version="0.3.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
@@ -119,7 +119,7 @@ def write_log(*, site=None, model="", upstream_model="", key_info=None, attempt=
 
 
 class SSEUsage:
-    """从 SSE 流里捡 usage 字段（用于统计 token）。"""
+    """从 SSE 流里拾 usage 字段（用于统计 token）。"""
 
     def __init__(self):
         self.buf = b""
@@ -347,41 +347,50 @@ async def admin_me(request: Request):
     return {"username": require_admin(request)}
 
 
-@app.get("/admin/api/config")
-async def get_config(request: Request):
+@app.get("/admin/api/account")
+async def get_account(request: Request):
     require_admin(request)
     row = db.query_one("SELECT username FROM admins ORDER BY id LIMIT 1")
     return {
-        "path": str(CONFIG_PATH),
         "username": row["username"] if row else "",
-        "exists": CONFIG_PATH.exists(),
+        "password_from_env": security.password_from_env(),
+        "username_from_env": security.username_from_env(),
     }
 
 
-@app.put("/admin/api/config")
-async def put_config(request: Request, payload: dict = Body(...)):
-    """修改账号 / 密码，并同步写回持久卷里的 config.json。"""
+@app.put("/admin/api/account")
+async def put_account(request: Request, payload: dict = Body(...)):
     require_admin(request)
     row = db.query_one("SELECT * FROM admins ORDER BY id LIMIT 1")
+    if row is None:
+        raise HTTPException(400, "账号不存在")
+
     new_username = (payload.get("username") or "").strip()
     old_pw = payload.get("old_password") or ""
     new_pw = payload.get("new_password") or ""
 
     if new_pw:
+        if security.password_from_env():
+            raise HTTPException(
+                400,
+                "面板密码由环境变量 ADMIN_PASSWORD 管理，请修改该环境变量后重启服务",
+            )
         if len(new_pw) < 6:
             raise HTTPException(400, "新密码至少 6 位")
-        if row is None or not security.verify_password(old_pw, row["password_hash"]):
+        if not security.verify_password(old_pw, row["password_hash"]):
             raise HTTPException(400, "原密码不正确")
         db.execute("UPDATE admins SET password_hash=? WHERE id=?",
                    (security.hash_password(new_pw), row["id"]))
-        fileconfig.set_value(["admin", "password"], new_pw)
 
-    if new_username and row and new_username != row["username"]:
+    if new_username and new_username != row["username"]:
+        if security.username_from_env():
+            raise HTTPException(
+                400, "面板账号由环境变量 ADMIN_USERNAME 管理，请修改该环境变量后重启服务"
+            )
         try:
             db.execute("UPDATE admins SET username=? WHERE id=?", (new_username, row["id"]))
         except Exception as e:
             raise HTTPException(400, f"修改失败：{e}")
-        fileconfig.set_value(["admin", "username"], new_username)
 
     return {"ok": True}
 
