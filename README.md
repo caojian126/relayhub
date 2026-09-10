@@ -58,7 +58,6 @@ Cherry Studio / Rikkahub / NextChat / 自定义脚本
 | 分站日志 | 每次请求（含失败与重试）都记录到具体站点 |
 | 多 API Key | 可自用，也可分发，每个 Key 可单独限流 |
 | 管理面板 | 单文件 SPA，零构建、无外部依赖 |
-| 配置持久化 | 数据与配置全部落在持久卷，调整配置无需重新部署 |
 
 ## 部署
 
@@ -72,40 +71,34 @@ Zeabur -> New Project -> Deploy from GitHub -> 选择本仓库（自动识别 `D
 
 服务 -> Storage -> 添加 Volume，**挂载路径填写 `/data`**。
 
-> 不挂载持久卷的话，容器每次重启都会丢失站点配置、API Key 和日志。
+> 只挂这一个。不挂的话，容器每次重启都会丢失站点配置、API Key 和日志。
 
 ### 3. 环境变量
 
-全部为可选项，仅用于首次初始化。
+| 变量 | 必填 | 说明 |
+|---|---|---|
+| `ADMIN_PASSWORD` | **强烈建议** | 面板登录密码。设置后即为唯一来源，每次启动都会把数据库里的密码校正成它；忘记密码时改这里再重启就能找回，不会被锁在面板外 |
+| `ADMIN_USERNAME` | 否 | 面板登录账号，默认 `admin`。不设置则不干预，面板里改过的用户名会保留 |
+| `SECRET_KEY` | 建议 | 登录态签名密钥，随便一串长随机字符。不设置也能跑，会随机生成并存在持久卷里 |
+| `TZ` | 建议 | 时区，默认 `Asia/Shanghai`。决定每日限额的重置时间与图表按天切分 |
+| `DATA_DIR` | 否 | 数据目录，默认 `/data` |
+| `REQUEST_TIMEOUT` | 否 | 上游请求超时秒数，默认 `600` |
 
-| 变量 | 说明 |
-|---|---|
-| `DATA_DIR` | 数据目录，默认 `/data` |
-| `TZ` | 时区，默认 `Asia/Shanghai`。决定每日限额的重置时间与图表按天切分 |
-| `ADMIN_USERNAME` | 首次初始化时的面板账号，默认 `admin` |
-| `ADMIN_PASSWORD` | 首次初始化时的面板密码。留空则随机生成 `config.json`，内容可自行修改 |
-| `SECRET_KEY` | 登录态签名密钥，可选 |
-| `REQUEST_TIMEOUT` | 上游请求超时秒数，默认 `600` |
+**只有面板账号密码走环境变量，各中转站的 API Key 是存在持久卷数据库里的**，不会出现在环境变量里。
 
 ### 4. 打开面板
 
 访问 `https://your-domain/admin`。
 
-首次启动时，`/data/config.json` 会自动生成：
+首次启动时，如果没有设置 `ADMIN_PASSWORD`，会随机生成一个并打印在部署日志里：
 
-```json
-{
-  "admin": {
-    "username": "admin",
-    "password": "自动生成的随机密码"
-  },
-  "server": {
-    "secret_key": "自动生成的密钥"
-  }
-}
 ```
-
-直接编辑这个文件并重启服务即可生效，无需重新部署。密码也可以在面板的「设置」页修改，修改后会同步写回该文件。
+================================================================
+[RelayHub] 已创建面板账号: admin
+[RelayHub] 随机初始密码: xxxxxxxxxxxxxx
+[RelayHub] 建议设置环境变量 ADMIN_PASSWORD，以免忘记后进不去
+================================================================
+```
 
 ## 使用流程
 
@@ -179,6 +172,7 @@ mkdir -p data
 docker build -t relayhub .
 docker run -d --name relayhub -p 8080:8080 \
   -v $(pwd)/data:/data \
+  -e ADMIN_PASSWORD=admin123 \
   -e SECRET_KEY=$(openssl rand -hex 32) \
   relayhub
 ```
@@ -188,9 +182,8 @@ docker run -d --name relayhub -p 8080:8080 \
 ```
 app/
 ├── config.py       环境变量
-├── fileconfig.py   /data/config.json 读写
 ├── db.py           SQLite 表结构与访问层（WAL 模式）
-├── security.py     密码哈希 / 会话令牌 / Key 生成
+├── security.py     密码哈希 / 会话令牌 / 面板账号初始化
 ├── engine.py       核心：候选筛选、排序、限额、熔断
 ├── models_sync.py  模型发现与同步
 ├── quota.py        上游额度巡检
@@ -203,6 +196,7 @@ app/
 - 上游 API Key 以明文保存在 `/data/relayhub.db`，请确保持久卷不对外暴露
 - 面板密码使用 PBKDF2-SHA256（120,000 轮）哈希存储
 - 未创建任何 API Key 时，接口处于开放模式，任何人都可调用。建议部署完成后立即创建一个
+- 建议始终设置 `ADMIN_PASSWORD` 环境变量，这是唯一的密码找回途径
 
 ## Roadmap
 

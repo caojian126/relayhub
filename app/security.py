@@ -1,19 +1,34 @@
 import base64
 import hashlib
 import hmac
+import os
 import secrets
 import time
 
-from . import db, fileconfig
-from .config import ADMIN_PASSWORD, ADMIN_USERNAME
+from . import db
+from .config import ADMIN_PASSWORD, ADMIN_USERNAME, DEFAULT_ADMIN_USERNAME
 
 ITERATIONS = 120_000
 
 
+def password_from_env():
+    return bool(ADMIN_PASSWORD)
+
+
+def username_from_env():
+    return bool(ADMIN_USERNAME)
+
+
 def _secret():
+    """登录态签名密钥。环境变量优先，否则随机生成并存在持久卷里。"""
+    env = os.getenv("SECRET_KEY")
+    if env:
+        if db.get_setting("secret_key") != env:
+            db.set_setting("secret_key", env)
+        return env
     v = db.get_setting("secret_key")
     if not v:
-        v = fileconfig.get(["server", "secret_key"]) or secrets.token_urlsafe(48)
+        v = secrets.token_urlsafe(48)
         db.set_setting("secret_key", v)
     return v
 
@@ -70,36 +85,47 @@ def check_login(username, password):
 
 
 def seed_admin():
-    """以 /data/config.json 为准初始化管理员账号。"""
-    cfg = fileconfig.load()
-    admin = cfg.get("admin") if isinstance(cfg.get("admin"), dict) else {}
-    file_username = (admin.get("username") or "").strip() or ADMIN_USERNAME
-    file_password = admin.get("password") or ""
+    """初始化 / 校正管理员账号。
 
-    secret_key = (cfg.get("server") or {}).get("secret_key")
-    if secret_key:
-        db.set_setting("secret_key", secret_key)
-
+    - 环境变量 ADMIN_PASSWORD 非空 -> 优先级最高，每次启动都校正
+    - 未设置 -> 首次启动随机生成并打印到日志，之后以数据库为准（面板可改）
+    """
     row = db.query_one("SELECT * FROM admins ORDER BY id LIMIT 1")
 
     if row is None:
-        password = file_password or ADMIN_PASSWORD or secrets.token_urlsafe(12)
+        username = ADMIN_USERNAME or DEFAULT_ADMIN_USERNAME
+        password = ADMIN_PASSWORD or secrets.token_urlsafe(12)
         db.execute(
             "INSERT INTO admins(username, password_hash, created_at) VALUES(?, ?, ?)",
-            (file_username, hash_password(password), time.time()),
+            (username, hash_password(password), time.time()),
         )
+        print("=" * 64, flush=True)
+        print(f"[RelayHub] 已创建面板账号: {username}", flush=True)
+        if ADMIN_PASSWORD:
+            print("[RelayHub] 密码来自环境变量 ADMIN_PASSWORD", flush=True)
+        else:
+            print(f"[RelayHub] 随机初始密码: {password}", flush=True)
+            print("[RelayHub] 建议设置环境变量 ADMIN_PASSWORD，以免忘记后进不去", flush=True)
+        print("=" * 64, flush=True)
         return
 
-    # 配置文件是唯一事实来源：密码/用户名与文件中不一致就同步过来
-    if file_password and not verify_password(file_password, row["password_hash"]):
-        db.execute(
-            "UPDATE admins SET password_hash=? WHERE id=?",
-            (hash_password(file_password), row["id"]),
+    if ADMIN_PASSWORD:
+        if not verify_password(ADMIN_PASSWORD, row["password_hash"]):
+            db.execute(
+                "UPDATE admins SET password_hash=? WHERE id=?",
+                (hash_password(ADMIN_PASSWORD), row["id"]),
+            )
+            print("[RelayHub] 已根据环境变量 ADMIN_PASSWORD 重置面板密码", flush=True)
+        if ADMIN_USERNAME and ADMIN_USERNAME != row["username"]:
+            db.execute(
+                "UPDATE admins SET username=? WHERE id=?", (ADMIN_USERNAME, row["id"])
+            )
+            print(f"[RelayHub] 已根据 ADMIN_USERNAME 将账号改为 {ADMIN_USERNAME}", flush=True)
+    else:
+        print(
+            "[RelayHub] 未设置 ADMIN_PASSWORD，面板密码以数据库为准（可在面板修改）",
+            flush=True,
         )
-        print("[RelayHub] 已按 config.json 更新管理员密码", flush=True)
-    if file_username and file_username != row["username"]:
-        db.execute("UPDATE admins SET username=? WHERE id=?", (file_username, row["id"]))
-        print(f"[RelayHub] 已按 config.json 更新管理员账号为 {file_username}", flush=True)
 
 
 def gen_api_key():
