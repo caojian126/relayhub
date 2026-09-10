@@ -208,6 +208,14 @@ def store(key, body, unified_json, stream=False):
     return cache.put(key, body.get("model"), body, unified_json, stream=stream)
 
 
+def _usage_of(unified):
+    if isinstance(unified, dict):
+        u = unified.get("usage")
+        if isinstance(u, dict):
+            return u
+    return None
+
+
 # ================================================================== 非流式
 
 async def complete(client, body, key_info, endpoint="openai"):
@@ -217,9 +225,8 @@ async def complete(client, body, key_info, endpoint="openai"):
     key = cache_key_for(endpoint, body)
     hit = lookup(key)
     if hit:
-        write_log(model=model, model_usage=hit["response_json"].get("usage"),
-                  ok=1, cached=1, endpoint=endpoint, latency_ms=0,
-                  key_info=key_info, stream=0)
+        write_log(model=model, usage=_usage_of(hit["response_json"]), ok=1, cached=1,
+                  endpoint=endpoint, latency_ms=0, key_info=key_info, stream=0)
         return hit["response_json"], True
 
     cands, max_attempts = _candidates(model)
