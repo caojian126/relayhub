@@ -324,6 +324,7 @@ async function doLogin(btn) {
     $('#login').hidden = true; $('#app').hidden = false;
     $('#who').textContent = r.username;
     switchTab('overview');
+    loadSystemBanner();
   } catch (e) { toast(e.message, 'err'); }
   finally { if (btn) btn.disabled = false; }
 }
@@ -907,11 +908,28 @@ RENDER.settings = async function () {
       </div>
 
       <div class="card glass"><h2>备份与恢复</h2>
-        <div class="note" style="margin-bottom:14px">导出内容包含站点、API Key、路由与设置，导出的 JSON 请自行妥善保管。</div>
-        <div class="row" style="max-width:560px">
-          <div><button onclick="exportCfg()">导出配置</button></div>
+        <div class="note" style="margin-bottom:14px">
+          <b>安全备份</b>：不含任何 API Key，适合分享和普通备份。<br>
+          <b>完整备份</b>：含中转站 Key 与网关 Key，属于敏感文件 ——
+          <b>不要上传公开仓库，也不要发给别人</b>。<br>
+          本地和云端是两个独立实例，数据库不会自动同步，迁移就靠这里手动导出再导入。
+        </div>
+        <div class="row" style="max-width:680px">
+          <div><button onclick="exportCfg('safe')">导出安全备份</button></div>
+          <div><button onclick="exportCfg('full')">导出完整备份 ⚠</button></div>
           <div><button onclick="importCfgClick()">导入配置</button>
             <input id="imp-file" type="file" accept="application/json" style="display:none" onchange="importCfg(this)"></div>
+        </div>
+        <div class="gap" style="max-width:420px">
+          <label>导入策略</label>
+          <select id="imp-mode">
+            <option value="merge">合并 — 同名覆盖，不同名新增，其余不动（推荐）</option>
+            <option value="overwrite">覆盖 — 清空后整体写入，用于换机迁移</option>
+          </select>
+          <div class="note" style="margin-top:8px">
+            两条铁律：格式不对的文件会被直接拒绝，<b>绝不会把现有数据库清空</b>；
+            覆盖导入时，同名站点的原 API Key 会被保留（因为安全备份本身不带 Key）。
+          </div>
         </div>
       </div>`;
   } catch (e) { el.innerHTML = `<div class="card glass empty">加载失败：${esc(e.message)}</div>`; }
@@ -963,15 +981,17 @@ async function saveAccount() {
   } catch (e) { toast(e.message, 'err'); }
 }
 
-async function exportCfg() {
+async function exportCfg(mode) {
+  mode = mode || 'safe';
+  if (mode === 'full' && !confirm('完整备份包含全部 API Key，请妥善保存。\n不要上传公开仓库，也不要发送给他人。\n\n确定导出？')) return;
   try {
-    const data = await api('/export');
+    const data = await api('/export?mode=' + mode);
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = 'relayhub-backup-' + new Date().toISOString().slice(0, 10) + '.json';
+    a.download = 'relayhub-' + mode + '-' + new Date().toISOString().slice(0, 10) + '.json';
     a.click(); URL.revokeObjectURL(a.href);
-    toast('已导出', 'ok');
+    toast(mode === 'full' ? '已导出完整备份，请注意保管' : '已导出安全备份', 'ok');
   } catch (e) { toast(e.message, 'err'); }
 }
 
@@ -980,13 +1000,25 @@ function importCfgClick() { $('#imp-file').click(); }
 function importCfg(input) {
   const f = input.files && input.files[0];
   if (!f) return;
+  const mode = $('#imp-mode') ? $('#imp-mode').value : 'merge';
   const reader = new FileReader();
   reader.onload = async () => {
-    if (!confirm('导入会覆盖同名站点与路由，且不可撤销。继续？')) { input.value = ''; return; }
+    let parsed;
     try {
-      const parsed = JSON.parse(reader.result);
-      const r = await api('/import', { method: 'POST', body: JSON.stringify({ data: parsed }) });
-      toast(`导入完成：站点 ${r.sites}、路由 ${r.routes}、密钥 ${r.keys}`, 'ok');
+      parsed = JSON.parse(reader.result);
+    } catch (e) {
+      toast('这不是合法 JSON，已放弃导入（原数据未受影响）', 'err');
+      input.value = '';
+      return;
+    }
+    const msg = mode === 'overwrite'
+      ? '覆盖导入会先清空现有的站点 / 路由 / 统一模型 / 密钥，再整体写入。\n（同名站点的 API Key 会保留）\n\n继续？'
+      : '合并导入：同名覆盖，不同名新增，其余数据不动。\n\n继续？';
+    if (!confirm(msg)) { input.value = ''; return; }
+    try {
+      const r = await api('/import', { method: 'POST', body: JSON.stringify({ data: parsed, strategy: mode }) });
+      toast(`导入完成（${r.strategy}）：站点 ${r.sites}、统一模型 ${r.groups}、节点 ${r.routes}、密钥 ${r.keys}`, 'ok');
+      RENDER.settings();
     } catch (e) { toast('导入失败：' + e.message, 'err'); }
     input.value = '';
   };
@@ -1441,6 +1473,17 @@ async function sendChat() {
   btn.disabled = false;
 }
 
+/* 顶部横幅：数据目录体检 + 开放模式提醒 */
+async function loadSystemBanner() {
+  try {
+    const s = await api('/system');
+    const msgs = [];
+    if (s.warning) msgs.push(`<b>⚠ 数据可能保不住</b>：${esc(s.warning)}`);
+    if (s.open_mode) msgs.push(`<b>⚠ 开放模式</b>：还没有创建任何网关 Key，任何人都能调用 <code>/v1/*</code> 接口。去「密钥」页建一个。`);
+    $('#banner-zone').innerHTML = msgs.map(m => `<div class="banner">${m}</div>`).join('');
+  } catch (e) { /* 拿不到就不显示，不打扰 */ }
+}
+
 /* ============ 启动 ============ */
 
 (async function boot() {
@@ -1448,6 +1491,7 @@ async function sendChat() {
   try {
     const me = await api('/me');
     $('#who').textContent = me.username; $('#app').hidden = false; switchTab('overview');
+    loadSystemBanner();
   } catch (e) { $('#login').hidden = false; }
 })();
 $('#lg-pass').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
