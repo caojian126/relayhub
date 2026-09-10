@@ -418,6 +418,15 @@ def main():
                   {"items": [{"site_id": sid, "upstream_model": "x"}]})
     check("给不存在的分组加节点返回 404", st == 404, st)
 
+    print("\n=== 16. 挑节点默认只看已导入的模型 ===", flush=True)
+    st, imp = admin("/models/imported")
+    check("已导入模型接口可用（按站点分组）", st == 200 and isinstance(imp, list), st)
+    names = {m for g in imp for m in g["models"]}
+    check("返回的是你在「模型」页导入过的模型", "gpt-5-mini" in names, sorted(names))
+    check("不含没导入的上游模型（X-fail-500）", "X-fail-500" not in names, sorted(names))
+    check("不含统一模型的节点（auto / batch1）",
+          "auto" not in names and "batch1" not in names, sorted(names))
+
     print("\n" + "=" * 56, flush=True)
     if FAILED:
         print(f"结果：{len(FAILED)} 项失败", flush=True)

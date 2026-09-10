@@ -1491,27 +1491,58 @@ async function delNode(id) {
   } catch (e) { toast(e.message, 'err'); }
 }
 
-/* ---- 批量挑选节点：从各站模型列表里勾，一次加一堆 ---- */
+/* ---- 批量挑选节点：默认只列「已导入」的模型，需要时才翻上游全部 ---- */
 
 let GPICK = [];
+let GPICK_UPSTREAM = false;
 
-async function openNodePicker() {
+async function openNodePicker(fromUpstream) {
   const name = CUR_GROUP;
-  openSheet('批量添加节点 · ' + name, '<div class="empty">正在拉取各站模型列表…</div>', '');
+  const up = !!fromUpstream;
+  openSheet(up ? '批量添加节点 · 上游全部模型' : '批量添加节点 · 已导入的模型',
+    `<div class="empty">${up ? '正在拉取各站上游模型列表…' : '正在读取已导入的模型…'}</div>`, '');
   try {
-    const scan = await api('/models/scan', { method: 'POST' });
     const nodes = await api('/groups/' + encodeURIComponent(name) + '/nodes');
     const have = new Set(nodes.map(n => n.site_id + '|' + n.real_model));
-    GPICK = scan.map(r => ({
+    let data;
+    if (up) {
+      const scan = await api('/models/scan', { method: 'POST' });
+      data = scan.map(r => ({
+        site_id: r.site_id,
+        site_name: r.site_name,
+        models: r.ok ? r.models : [],
+        error: r.ok ? '' : (r.error || '拉取失败'),
+      }));
+    } else {
+      const rows = await api('/models/imported');
+      data = rows.map(r => ({
+        site_id: r.site_id,
+        site_name: r.site_name,
+        models: r.models || [],
+        error: '',
+      }));
+    }
+    GPICK = data.map(r => ({
       site_id: r.site_id,
       site_name: r.site_name,
-      models: r.ok ? r.models : [],
-      existing: r.ok ? r.models.filter(m => have.has(r.site_id + '|' + m)) : [],
-      error: r.ok ? '' : (r.error || '拉取失败'),
+      models: r.models,
+      error: r.error,
+      existing: r.models.filter(m => have.has(r.site_id + '|' + m)),
     }));
+    GPICK_UPSTREAM = up;
+
+    if (!up && !GPICK.length) {
+      $('#sheet-body').innerHTML = `<div class="empty">
+        你还没有导入任何模型。<br>
+        先去「站点」页点某个站的「拉模型」，勾选需要的模型导入，再回来绑节点。</div>`;
+      $('#sheet-foot').innerHTML =
+        `<button onclick="openNodePicker(true)">改从上游全部模型里挑</button>
+         <button onclick="drawGroupSheet()">返回</button>`;
+      return;
+    }
     drawNodePicker();
   } catch (e) {
-    $('#sheet-body').innerHTML = `<div class="empty">拉取失败：${esc(e.message)}</div>`;
+    $('#sheet-body').innerHTML = `<div class="empty">读取失败：${esc(e.message)}</div>`;
   }
 }
 
@@ -1558,16 +1589,23 @@ function drawNodePicker() {
         <button class="sm" onclick="setAllGpick(false, ${r.site_id})">全不选</button></div>
       <div class="models">${chips || '<span class="muted">无</span>'}</div></div>`;
   }).join('');
+  const src = GPICK_UPSTREAM
+    ? '数据源：<b>上游全部模型</b>（实时拉取）'
+    : '数据源：<b>你已导入的模型</b>（在「模型」页挑过的那些）';
   $('#sheet-body').innerHTML = `
     <div class="note" style="margin-bottom:14px">
-      共 <b>${total}</b> 个模型，其中 <b>${usable}</b> 个还没加进本组。<b>默认全部不勾选</b>，自己挑。
+      ${src}。共 <b>${total}</b> 个，其中 <b>${usable}</b> 个还没加进本组。
+      <b>默认全部不勾选</b>，自己挑。
       <div class="gap">
         <button class="sm" onclick="setAllGpick(true)">全部全选</button>
         <button class="sm" onclick="setAllGpick(false)">全部取消</button>
       </div>
     </div>
-    ${groups || '<div class="empty">没有可用的站点</div>'}`;
+    ${groups || `<div class="empty">${
+      GPICK_UPSTREAM ? '没有可用的站点' : '这些站点上还没有已导入的模型'}</div>`}`;
   $('#sheet-foot').innerHTML = `<span class="muted">已选 <b id="np-count">0</b> 个</span>
+    <button onclick="openNodePicker(${GPICK_UPSTREAM ? 'false' : 'true'})">${
+      GPICK_UPSTREAM ? '只看已导入的' : '改从上游全部里挑'}</button>
     <button onclick="drawGroupSheet()">返回</button>
     <button class="primary" id="np-add" onclick="addPickedNodes()" disabled>添加选中的 0 个</button>`;
   updateGpickCount();

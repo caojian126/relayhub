@@ -1186,6 +1186,34 @@ async def import_models(request: Request, payload: dict = Body(...)):
     return {"ok": True, "added": added, "total": len(items)}
 
 
+@app.get("/admin/api/models/imported")
+async def imported_models(request: Request):
+    """各站点「已经导入到系统里」的模型名，按站点分组。
+
+    这是「批量挑选节点」的默认数据源 —— 用户先在「模型」页挑好货，
+    绑节点时就只该看到这些，而不是再把上游几百个模型倒一遍。
+    """
+    require_admin(request)
+    rows = db.query(
+        """
+        SELECT s.id AS site_id, s.name AS site_name, s.enabled AS site_enabled,
+               r.model AS model
+        FROM routes r JOIN sites s ON s.id = r.site_id
+        WHERE r.upstream_model = ''
+        ORDER BY s.priority, s.id, r.model
+        """
+    )
+    out, index = [], {}
+    for row in rows:
+        sid = row["site_id"]
+        if sid not in index:
+            index[sid] = {"site_id": sid, "site_name": row["site_name"],
+                          "site_enabled": int(row["site_enabled"]), "models": []}
+            out.append(index[sid])
+        index[sid]["models"].append(row["model"])
+    return out
+
+
 # -------- 路由
 
 @app.get("/admin/api/routes")
