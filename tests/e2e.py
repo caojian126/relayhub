@@ -394,6 +394,30 @@ def main():
     st, rs = admin("/routes")
     check("节点确实被一起删掉了", "gpt-5" not in [x["model"] for x in rs])
 
+    print("\n=== 15. 批量添加统一模型节点 ===", flush=True)
+    st, sites_now = admin("/sites")
+    sid = sites_now[0]["id"]
+    make_group("batch1", [])
+    st, r = admin("/groups/batch1/nodes/batch", "POST", {"items": [
+        {"site_id": sid, "upstream_model": "gemini-3.7-flash"},
+        {"site_id": sid, "upstream_model": "gemini-3.7-pro"},
+    ]})
+    check("批量加节点：同站第二条被跳过（站点×模型唯一）",
+          st == 200 and r.get("added") == 1 and len(r.get("skipped") or []) == 1, r)
+    st, nodes = admin("/groups/batch1/nodes")
+    check("批量加节点已落库",
+          len(nodes) == 1 and nodes[0]["real_model"] == "gemini-3.7-flash",
+          [(n["site_name"], n["real_model"]) for n in nodes])
+    st, r = admin("/groups/batch1/nodes/batch", "POST", {"items": []})
+    check("空 items 被拒绝", st == 400, st)
+    st, r = admin("/groups/batch1/nodes/batch", "POST",
+                  {"items": [{"site_id": sid, "upstream_model": "gemini-3.7-pro"}]})
+    check("重复站×模型被跳过而不是整批失败",
+          st == 200 and r.get("added") == 0 and len(r["skipped"]) == 1, r)
+    st, r = admin("/groups/不存在的组/nodes/batch", "POST",
+                  {"items": [{"site_id": sid, "upstream_model": "x"}]})
+    check("给不存在的分组加节点返回 404", st == 404, st)
+
     print("\n" + "=" * 56, flush=True)
     if FAILED:
         print(f"结果：{len(FAILED)} 项失败", flush=True)

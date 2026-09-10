@@ -958,6 +958,54 @@ async def add_node(name: str, request: Request, payload: dict = Body(...)):
     return {"ok": True, "id": cur.lastrowid}
 
 
+@app.post("/admin/api/groups/{name}/nodes/batch")
+async def add_nodes_batch(name: str, request: Request, payload: dict = Body(...)):
+    """批量给统一模型加节点。
+
+    items: [{"site_id": 1, "upstream_model": "gemini-3.7-flash"}, ...]
+    这是「一次挑一堆模型」的入口，省得一个个手打上游模型名。
+
+    同一个站点在同一个分组里只能有一个节点（routes 上是 UNIQUE(site_id, model)），
+    重复的会被跳过并在 skipped 里返回，不会让整批失败。
+    """
+    require_admin(request)
+    if _group_row(name) is None:
+        raise HTTPException(404, "统一模型不存在，请先创建")
+    items = payload.get("items") or []
+    if not items:
+        raise HTTPException(400, "没有选择任何模型")
+    if len(items) > 500:
+        raise HTTPException(400, "一次最多添加 500 个节点")
+
+    row = db.query_one("SELECT COALESCE(MAX(priority), 0) AS m FROM routes WHERE model=?",
+                       (name,))
+    nextp = int(row["m"] or 0) + 10
+    limit = int(payload.get("daily_limit") or 0)
+    added, skipped = 0, []
+    for it in items:
+        try:
+            site_id = int(it.get("site_id"))
+        except (TypeError, ValueError):
+            continue
+        upstream = (it.get("upstream_model") or "").strip()
+        if not upstream:
+            continue
+        if db.query_one("SELECT 1 FROM sites WHERE id=?", (site_id,)) is None:
+            skipped.append(f"{upstream}（站点不存在）")
+            continue
+        if db.query_one("SELECT 1 FROM routes WHERE site_id=? AND model=?",
+                        (site_id, name)) is not None:
+            skipped.append(upstream)
+            continue
+        db.execute(
+            """INSERT INTO routes(site_id, model, upstream_model, enabled, daily_limit, priority)
+               VALUES (?,?,?,1,?,?)""",
+            (site_id, name, upstream, limit, nextp))
+        nextp += 10
+        added += 1
+    return {"ok": True, "added": added, "skipped": skipped}
+
+
 @app.put("/admin/api/groups/nodes/{node_id}")
 async def update_node(node_id: int, request: Request, payload: dict = Body(...)):
     require_admin(request)

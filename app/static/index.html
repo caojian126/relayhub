@@ -1421,9 +1421,13 @@ async function drawGroupSheet() {
       <div style="max-width:170px"><label>每日上限（0=不限）</label><input id="n-limit" type="number" value="0"></div>
     </div>
     <div class="gap">
+      <button class="primary" onclick="addNode()">添加这一个</button>
+      <button onclick="openNodePicker()">批量挑选模型（推荐）</button>
       <button onclick="loadSiteModels(true)">拉取该站模型列表</button>
-      <button class="primary" onclick="addNode()">添加节点</button>
-      <span class="muted" style="margin-left:8px">同一个「站点 × 模型」在一个统一模型里只能出现一次</span>
+    </div>
+    <div class="note" style="margin-top:10px">
+      一个个加太慢就直接点 <b>「批量挑选模型」</b>：会把各站模型列成勾选列表，
+      一次勾一堆，全部加进本组，不用手打模型名。
     </div>`, '');
 
   initDrag($('#node-body'));
@@ -1484,6 +1488,105 @@ async function delNode(id) {
   try {
     await api('/groups/nodes/' + id, { method: 'DELETE' });
     toast('已移除', 'ok'); await drawGroupSheet(); RENDER.groups();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+/* ---- 批量挑选节点：从各站模型列表里勾，一次加一堆 ---- */
+
+let GPICK = [];
+
+async function openNodePicker() {
+  const name = CUR_GROUP;
+  openSheet('批量添加节点 · ' + name, '<div class="empty">正在拉取各站模型列表…</div>', '');
+  try {
+    const scan = await api('/models/scan', { method: 'POST' });
+    const nodes = await api('/groups/' + encodeURIComponent(name) + '/nodes');
+    const have = new Set(nodes.map(n => n.site_id + '|' + n.real_model));
+    GPICK = scan.map(r => ({
+      site_id: r.site_id,
+      site_name: r.site_name,
+      models: r.ok ? r.models : [],
+      existing: r.ok ? r.models.filter(m => have.has(r.site_id + '|' + m)) : [],
+      error: r.ok ? '' : (r.error || '拉取失败'),
+    }));
+    drawNodePicker();
+  } catch (e) {
+    $('#sheet-body').innerHTML = `<div class="empty">拉取失败：${esc(e.message)}</div>`;
+  }
+}
+
+function updateGpickCount() {
+  const n = $$('#sheet-body .npick').filter(cb => !cb.disabled && cb.checked).length;
+  const c = $('#np-count');
+  if (c) c.textContent = n;
+  const b = $('#np-add');
+  if (b) { b.disabled = n === 0; b.textContent = `添加选中的 ${n} 个`; }
+}
+
+function setAllGpick(on, siteId) {
+  $$('#sheet-body .npick').forEach(cb => {
+    if (cb.disabled) return;
+    if (siteId !== undefined && String(cb.dataset.site) !== String(siteId)) return;
+    cb.checked = on;
+    cb.parentNode.classList.toggle('on', on);
+  });
+  updateGpickCount();
+}
+
+function drawNodePicker() {
+  let total = 0, usable = 0;
+  GPICK.forEach(r => { total += r.models.length; usable += r.models.length - r.existing.length; });
+  const groups = GPICK.map(r => {
+    if (r.error) {
+      return `<div class="site-group"><div class="gh">${esc(r.site_name)}
+        <span class="tag err">拉取失败</span></div>
+        <div class="note">${esc(r.error)}<br>该站拿不到模型列表，只能返回上一页手动输入模型名。</div></div>`;
+    }
+    const have = new Set(r.existing);
+    const chips = r.models.map(m => {
+      const has = have.has(m);
+      return `<label class="model ${has ? 'done' : ''}">
+        <input type="checkbox" class="npick" data-site="${r.site_id}" data-model="${esc(m)}"
+          ${has ? 'disabled' : ''}
+          onchange="this.parentNode.classList.toggle('on', this.checked); updateGpickCount()">
+        ${esc(m)}${has ? ' <span class="tag dim">已在本组</span>' : ''}</label>`;
+    }).join('');
+    return `<div class="site-group">
+      <div class="gh">${esc(r.site_name)}
+        <span class="tag ${r.models.length ? 'acc' : 'dim'}">${r.models.length} 个</span>
+        <button class="sm" onclick="setAllGpick(true, ${r.site_id})">全选</button>
+        <button class="sm" onclick="setAllGpick(false, ${r.site_id})">全不选</button></div>
+      <div class="models">${chips || '<span class="muted">无</span>'}</div></div>`;
+  }).join('');
+  $('#sheet-body').innerHTML = `
+    <div class="note" style="margin-bottom:14px">
+      共 <b>${total}</b> 个模型，其中 <b>${usable}</b> 个还没加进本组。<b>默认全部不勾选</b>，自己挑。
+      <div class="gap">
+        <button class="sm" onclick="setAllGpick(true)">全部全选</button>
+        <button class="sm" onclick="setAllGpick(false)">全部取消</button>
+      </div>
+    </div>
+    ${groups || '<div class="empty">没有可用的站点</div>'}`;
+  $('#sheet-foot').innerHTML = `<span class="muted">已选 <b id="np-count">0</b> 个</span>
+    <button onclick="drawGroupSheet()">返回</button>
+    <button class="primary" id="np-add" onclick="addPickedNodes()" disabled>添加选中的 0 个</button>`;
+  updateGpickCount();
+}
+
+async function addPickedNodes() {
+  const items = [];
+  $$('#sheet-body .npick').forEach(cb => {
+    if (cb.disabled || !cb.checked) return;
+    items.push({ site_id: parseInt(cb.dataset.site, 10), upstream_model: cb.dataset.model });
+  });
+  if (!items.length) return toast('没有勾选任何模型', 'err');
+  try {
+    const r = await api('/groups/' + encodeURIComponent(CUR_GROUP) + '/nodes/batch',
+      { method: 'POST', body: JSON.stringify({ items }) });
+    let msg = `已添加 ${r.added} 个节点`;
+    if (r.skipped && r.skipped.length) msg += `，跳过 ${r.skipped.length} 个（该站已在本组里了）`;
+    toast(msg, 'ok');
+    drawGroupSheet();
   } catch (e) { toast(e.message, 'err'); }
 }
 
