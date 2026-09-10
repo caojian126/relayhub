@@ -10,8 +10,9 @@ from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 
-from . import db, engine, quota, security
-from .config import CONNECT_TIMEOUT, REQUEST_TIMEOUT
+from . import db, engine, fileconfig, models_sync, quota, security
+from .config import CONFIG_PATH, CONNECT_TIMEOUT, REQUEST_TIMEOUT
+from .db import DEFAULT_SETTINGS
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -25,15 +26,19 @@ async def lifespan(app: FastAPI):
         limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
         follow_redirects=True,
     )
-    task = asyncio.create_task(quota.background_loop())
+    tasks = [
+        asyncio.create_task(quota.background_loop()),
+        asyncio.create_task(models_sync.background_loop(app.state.client)),
+    ]
     try:
         yield
     finally:
-        task.cancel()
+        for t in tasks:
+            t.cancel()
         await app.state.client.aclose()
 
 
-app = FastAPI(title="RelayHub", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="RelayHub", version="0.2.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
@@ -86,13 +91,6 @@ def incr_key_counter(key_id):
         (engine.today(), key_id),
     )
     db.execute("UPDATE api_keys SET last_used_at=? WHERE id=?", (time.time(), key_id))
-
-
-def upstream_headers(site):
-    headers = {"Content-Type": "application/json"}
-    if site.get("api_key"):
-        headers["Authorization"] = "Bearer " + site["api_key"]
-    return headers
 
 
 def write_log(*, site=None, model="", upstream_model="", key_info=None, attempt=1, ok=0,
@@ -198,7 +196,7 @@ async def chat_completions(request: Request):
                 r = await client.post(
                     engine.norm_base(site["base_url"]) + "/chat/completions",
                     json=payload,
-                    headers=upstream_headers(site),
+                    headers=engine.upstream_headers(site),
                 )
             except Exception as e:
                 engine.record_failure(site["site_id"], e)
@@ -260,7 +258,7 @@ async def chat_completions(request: Request):
                     "POST",
                     engine.norm_base(site["base_url"]) + "/chat/completions",
                     json=payload,
-                    headers=upstream_headers(site),
+                    headers=engine.upstream_headers(site),
                 )
                 resp = await client.send(req, stream=True)
             except Exception as e:
@@ -349,19 +347,165 @@ async def admin_me(request: Request):
     return {"username": require_admin(request)}
 
 
-@app.post("/admin/api/password")
-async def admin_password(request: Request, payload: dict = Body(...)):
+@app.get("/admin/api/config")
+async def get_config(request: Request):
     require_admin(request)
-    old = payload.get("old_password") or ""
-    new = payload.get("new_password") or ""
-    if len(new) < 6:
-        raise HTTPException(400, "新密码至少 6 位")
+    row = db.query_one("SELECT username FROM admins ORDER BY id LIMIT 1")
+    return {
+        "path": str(CONFIG_PATH),
+        "username": row["username"] if row else "",
+        "exists": CONFIG_PATH.exists(),
+    }
+
+
+@app.put("/admin/api/config")
+async def put_config(request: Request, payload: dict = Body(...)):
+    """修改账号 / 密码，并同步写回持久卷里的 config.json。"""
+    require_admin(request)
     row = db.query_one("SELECT * FROM admins ORDER BY id LIMIT 1")
-    if row is None or not security.verify_password(old, row["password_hash"]):
-        raise HTTPException(400, "原密码不正确")
-    db.execute("UPDATE admins SET password_hash=? WHERE id=?",
-               (security.hash_password(new), row["id"]))
+    new_username = (payload.get("username") or "").strip()
+    old_pw = payload.get("old_password") or ""
+    new_pw = payload.get("new_password") or ""
+
+    if new_pw:
+        if len(new_pw) < 6:
+            raise HTTPException(400, "新密码至少 6 位")
+        if row is None or not security.verify_password(old_pw, row["password_hash"]):
+            raise HTTPException(400, "原密码不正确")
+        db.execute("UPDATE admins SET password_hash=? WHERE id=?",
+                   (security.hash_password(new_pw), row["id"]))
+        fileconfig.set_value(["admin", "password"], new_pw)
+
+    if new_username and row and new_username != row["username"]:
+        try:
+            db.execute("UPDATE admins SET username=? WHERE id=?", (new_username, row["id"]))
+        except Exception as e:
+            raise HTTPException(400, f"修改失败：{e}")
+        fileconfig.set_value(["admin", "username"], new_username)
+
     return {"ok": True}
+
+
+# -------- 配置备份
+
+@app.get("/admin/api/export")
+async def export_config(request: Request):
+    require_admin(request)
+    sites = []
+    for row in db.query("SELECT * FROM sites ORDER BY id"):
+        d = db.rowdict(row)
+        sites.append({
+            "name": d["name"],
+            "base_url": d["base_url"],
+            "api_key": d["api_key"],
+            "enabled": d["enabled"],
+            "priority": d["priority"],
+            "note": d["note"],
+        })
+    routes = [
+        db.rowdict(r) for r in db.query(
+            "SELECT site_id, model, upstream_model, enabled, daily_limit FROM routes"
+        )
+    ]
+    keys = [
+        db.rowdict(r) for r in db.query(
+            "SELECT key, name, enabled, daily_limit, note FROM api_keys"
+        )
+    ]
+    return {
+        "version": 1,
+        "app": "relayhub",
+        "exported_at": time.time(),
+        "settings": {k: db.get_setting(k) for k in DEFAULT_SETTINGS},
+        "sites": sites,
+        "routes": routes,
+        "keys": keys,
+    }
+
+
+@app.post("/admin/api/import")
+async def import_config(request: Request, payload: dict = Body(...)):
+    require_admin(request)
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+
+    name_to_id = {}
+    for s in data.get("sites") or []:
+        name = (s.get("name") or "").strip()
+        if not name:
+            continue
+        base_url = (s.get("base_url") or "").strip()
+        api_key = s.get("api_key") or ""
+        enabled = 1 if s.get("enabled", True) else 0
+        priority = int(s.get("priority") or 100)
+        note = s.get("note") or ""
+        row = db.query_one("SELECT id FROM sites WHERE name=?", (name,))
+        if row:
+            db.execute(
+                """UPDATE sites SET base_url=?, api_key=?, enabled=?, priority=?, note=?
+                   WHERE id=?""",
+                (base_url, api_key, enabled, priority, note, row["id"]),
+            )
+            name_to_id[name] = row["id"]
+        else:
+            cur = db.execute(
+                """INSERT INTO sites(name, base_url, api_key, enabled, priority, note, created_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (name, base_url, api_key, enabled, priority, note, time.time()),
+            )
+            name_to_id[name] = cur.lastrowid
+
+    site_by_id = {}
+    for row in db.query("SELECT id, name FROM sites"):
+        site_by_id[row["id"]] = row["name"]
+
+    added_routes = 0
+    for r in data.get("routes") or []:
+        model = (r.get("model") or "").strip()
+        if not model:
+            continue
+        site_name = r.get("site_name") or site_by_id.get(r.get("site_id"))
+        if not site_name or site_name not in name_to_id:
+            continue
+        site_id = name_to_id[site_name]
+        upstream_model = (r.get("upstream_model") or "").strip()
+        daily_limit = int(r.get("daily_limit") or 0)
+        enabled = 1 if r.get("enabled", True) else 0
+        db.execute(
+            """INSERT INTO routes(site_id, model, upstream_model, enabled, daily_limit)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(site_id, model) DO UPDATE SET
+                 upstream_model=excluded.upstream_model,
+                 daily_limit=excluded.daily_limit,
+                 enabled=excluded.enabled""",
+            (site_id, model, upstream_model, enabled, daily_limit),
+        )
+        added_routes += 1
+
+    added_keys = 0
+    for k in data.get("keys") or []:
+        key = (k.get("key") or "").strip()
+        if not key:
+            continue
+        if db.query_one("SELECT 1 FROM api_keys WHERE key=?", (key,)):
+            continue
+        db.execute(
+            """INSERT INTO api_keys(key, name, enabled, daily_limit, note, created_at)
+               VALUES (?,?,?,?,?,?)""",
+            (key, k.get("name") or "未命名", 1 if k.get("enabled", True) else 0,
+             int(k.get("daily_limit") or 0), k.get("note") or "", time.time()),
+        )
+        added_keys += 1
+
+    for k, v in (data.get("settings") or {}).items():
+        if k in DEFAULT_SETTINGS:
+            db.set_setting(k, v)
+
+    return {
+        "ok": True,
+        "sites": len(data.get("sites") or []),
+        "routes": added_routes,
+        "keys": added_keys,
+    }
 
 
 # -------- 站点
@@ -452,21 +596,11 @@ async def test_site(site_id: int, request: Request):
     row = db.query_one("SELECT * FROM sites WHERE id=?", (site_id,))
     if row is None:
         raise HTTPException(404, "站点不存在")
-    site = db.rowdict(row)
-    url = engine.norm_base(site["base_url"]) + "/models"
-    headers = upstream_headers(site)
-    try:
-        r = await request.app.state.client.get(url, headers=headers, timeout=25)
-    except Exception as e:
-        return {"ok": False, "message": f"连接失败: {e}", "models": []}
-    if r.status_code != 200:
-        return {"ok": False, "message": f"HTTP {r.status_code}: {(r.text or '')[:300]}", "models": []}
-    try:
-        data = r.json()
-        models = [m.get("id") for m in data.get("data", []) if isinstance(m, dict)]
-    except Exception:
-        return {"ok": False, "message": "返回不是合法 JSON", "models": []}
-    return {"ok": True, "message": f"正常，发现 {len(models)} 个模型", "models": models}
+    result = await models_sync.scan_site(request.app.state.client, db.rowdict(row))
+    if result["ok"]:
+        return {"ok": True, "message": f"正常，发现 {len(result['models'])} 个模型",
+                "models": result["models"]}
+    return {"ok": False, "message": result["error"], "models": []}
 
 
 @app.post("/admin/api/sites/{site_id}/quota")
@@ -482,13 +616,30 @@ async def site_quota(site_id: int, request: Request):
     return info
 
 
+# -------- 模型发现与同步
+
+@app.post("/admin/api/models/scan")
+async def scan_models(request: Request):
+    require_admin(request)
+    return await models_sync.scan_all(request.app.state.client)
+
+
+@app.post("/admin/api/models/import")
+async def import_models(request: Request, payload: dict = Body(...)):
+    require_admin(request)
+    items = payload.get("items") or []
+    daily_limit = int(payload.get("daily_limit") or 0)
+    added = models_sync.import_models(items, daily_limit)
+    return {"ok": True, "added": added, "total": len(items)}
+
+
 # -------- 路由（站点 × 模型）
 
 @app.get("/admin/api/routes")
 async def list_routes(request: Request):
     require_admin(request)
     rows = db.query(
-        """SELECT r.*, s.name AS site_name, s.enabled AS site_enabled
+        """SELECT r.*, s.name AS site_name, s.enabled AS site_enabled, s.priority AS site_priority
            FROM routes r JOIN sites s ON s.id = r.site_id
            ORDER BY r.model, s.priority, s.id"""
     )
@@ -707,28 +858,24 @@ async def stats(request: Request, days: int = 7):
 
 # -------- 设置
 
+SETTING_KEYS = (
+    "strategy", "max_attempts", "circuit_threshold", "circuit_cooldown",
+    "inject_stream_usage", "quota_check_interval",
+    "auto_sync_models", "auto_sync_interval",
+)
+
+
 @app.get("/admin/api/settings")
 async def get_settings(request: Request):
     require_admin(request)
-    return {
-        "strategy": db.get_setting("strategy", "balanced"),
-        "max_attempts": db.get_setting("max_attempts", 3),
-        "circuit_threshold": db.get_setting("circuit_threshold", 3),
-        "circuit_cooldown": db.get_setting("circuit_cooldown", 600),
-        "inject_stream_usage": db.get_setting("inject_stream_usage", True),
-        "quota_check_interval": db.get_setting("quota_check_interval", 3600),
-    }
+    return {k: db.get_setting(k, DEFAULT_SETTINGS.get(k)) for k in SETTING_KEYS}
 
 
 @app.put("/admin/api/settings")
 async def put_settings(request: Request, payload: dict = Body(...)):
     require_admin(request)
-    allowed = {
-        "strategy", "max_attempts", "circuit_threshold",
-        "circuit_cooldown", "inject_stream_usage", "quota_check_interval",
-    }
     for k, v in payload.items():
-        if k in allowed:
+        if k in SETTING_KEYS:
             db.set_setting(k, v)
     return await get_settings(request)
 
