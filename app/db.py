@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import threading
+import time
 
 from .config import DATA_DIR, DB_PATH
 
@@ -30,6 +31,16 @@ CREATE TABLE IF NOT EXISTS sites (
   created_at        REAL    NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS model_groups (
+  name        TEXT PRIMARY KEY,
+  display     TEXT    NOT NULL DEFAULT '',
+  enabled     INTEGER NOT NULL DEFAULT 1,
+  is_public   INTEGER NOT NULL DEFAULT 1,
+  strategy    TEXT    NOT NULL DEFAULT '',
+  note        TEXT    NOT NULL DEFAULT '',
+  created_at  REAL    NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS routes (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   site_id         INTEGER NOT NULL,
@@ -37,6 +48,15 @@ CREATE TABLE IF NOT EXISTS routes (
   upstream_model  TEXT    NOT NULL DEFAULT '',
   enabled         INTEGER NOT NULL DEFAULT 1,
   daily_limit     INTEGER NOT NULL DEFAULT 0,
+  priority        INTEGER NOT NULL DEFAULT 100,
+  fail_streak     INTEGER NOT NULL DEFAULT 0,
+  ok_count        INTEGER NOT NULL DEFAULT 0,
+  fail_count      INTEGER NOT NULL DEFAULT 0,
+  last_error      TEXT    NOT NULL DEFAULT '',
+  last_ok_at      REAL    NOT NULL DEFAULT 0,
+  last_fail_at    REAL    NOT NULL DEFAULT 0,
+  last_latency_ms INTEGER NOT NULL DEFAULT 0,
+  circuit_until   REAL    NOT NULL DEFAULT 0,
   UNIQUE(site_id, model)
 );
 
@@ -97,6 +117,8 @@ CREATE TABLE IF NOT EXISTS request_logs (
   completion_tokens INTEGER NOT NULL DEFAULT 0,
   total_tokens      INTEGER NOT NULL DEFAULT 0,
   stream            INTEGER NOT NULL DEFAULT 0,
+  switches          INTEGER NOT NULL DEFAULT 0,
+  stream_phase      TEXT    NOT NULL DEFAULT '',
   error             TEXT    NOT NULL DEFAULT ''
 );
 
@@ -132,6 +154,10 @@ DEFAULT_SETTINGS = {
     "cache_only_deterministic": True,   # 仅缓存 temperature=0 的请求
     "cache_ttl": 3600,                  # 缓存有效期（秒），0 = 永不过期
     "cache_max_entries": 1000,          # 最大缓存条目数
+    "node_circuit_threshold": 3,        # 单个「站点×模型」节点连续失败几次进入冷却
+    "node_cooldown": 60,                # 节点冷却秒数（期间跳过该节点，到点自动恢复）
+    "rewrite_model": True,              # 回包时把 model 字段改写成客户端请求的统一模型名
+    "switch_before_output": True,       # 流式：开始输出前允许换节点；开始输出后绝不换
 }
 
 # 建表后需要补充的列（兼容旧数据库）
@@ -139,6 +165,19 @@ MIGRATIONS = {
     "request_logs": {
         "cached": "INTEGER NOT NULL DEFAULT 0",
         "endpoint": "TEXT NOT NULL DEFAULT 'openai'",
+        "switches": "INTEGER NOT NULL DEFAULT 0",
+        "stream_phase": "TEXT NOT NULL DEFAULT ''",
+    },
+    "routes": {
+        "priority": "INTEGER NOT NULL DEFAULT 100",
+        "fail_streak": "INTEGER NOT NULL DEFAULT 0",
+        "ok_count": "INTEGER NOT NULL DEFAULT 0",
+        "fail_count": "INTEGER NOT NULL DEFAULT 0",
+        "last_error": "TEXT NOT NULL DEFAULT ''",
+        "last_ok_at": "REAL NOT NULL DEFAULT 0",
+        "last_fail_at": "REAL NOT NULL DEFAULT 0",
+        "last_latency_ms": "INTEGER NOT NULL DEFAULT 0",
+        "circuit_until": "REAL NOT NULL DEFAULT 0",
     },
 }
 
@@ -210,3 +249,23 @@ def init_db():
     for k, v in DEFAULT_SETTINGS.items():
         if query_one("SELECT 1 FROM settings WHERE k=?", (k,)) is None:
             set_setting(k, v)
+    sync_groups()
+
+
+def sync_groups():
+    """为每个已存在的 routes.model 补齐一条统一模型记录。
+
+    旧库升级到本版本时自动执行，保证已经配好的模型不会从 /v1/models 里消失。
+    只新增，绝不删除用户手工建的统一模型。
+    """
+    now = time.time()
+    for row in query("SELECT DISTINCT model FROM routes"):
+        name = (row["model"] or "").strip()
+        if not name:
+            continue
+        if query_one("SELECT 1 FROM model_groups WHERE name=?", (name,)) is None:
+            execute(
+                """INSERT INTO model_groups(name, display, enabled, is_public, strategy, note, created_at)
+                   VALUES (?, '', 1, 1, '', '', ?)""",
+                (name, now),
+            )

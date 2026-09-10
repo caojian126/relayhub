@@ -185,6 +185,20 @@ footer b{color:var(--ink-2)}
   .blob{animation:none}
   main section.active{animation:none}
 }
+/* ---- 统一模型节点拖拽 / 聊天测试 ---- */
+.noderow{cursor:grab}
+.noderow.dragging{opacity:.4}
+.noderow .drag{color:var(--ink-3);font-size:15px;letter-spacing:1px;user-select:none;width:24px}
+.chat-box{display:flex;flex-direction:column;gap:12px;min-height:200px;max-height:50vh;overflow-y:auto;padding:4px 2px}
+.msg{max-width:80%;padding:11px 15px;border-radius:16px;font-size:13.5px;line-height:1.7;
+  white-space:pre-wrap;word-break:break-word}
+.msg.me{align-self:flex-end;background:var(--grad);color:#fff;border-bottom-right-radius:5px}
+.msg.ai{align-self:flex-start;background:rgba(255,255,255,.74);border:1px solid rgba(255,255,255,.9);
+  border-bottom-left-radius:5px}
+.msg.meta{align-self:stretch;max-width:100%;background:transparent;border:1px dashed var(--line);
+  color:var(--ink-3);font-size:11.5px;padding:8px 12px;border-radius:12px}
+.msg.meta b{color:var(--ink-2)}
+.chain{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
 </style>
 </head>
 <body>
@@ -214,10 +228,13 @@ footer b{color:var(--ink-2)}
   </header>
 
   <div class="wrap">
+    <div id="banner-zone"></div>
     <nav class="tabs">
       <button data-tab="overview" class="active">概览</button>
       <button data-tab="sites">站点</button>
       <button data-tab="models">模型</button>
+      <button data-tab="groups">统一模型</button>
+      <button data-tab="chat">测试</button>
       <button data-tab="keys">密钥</button>
       <button data-tab="logs">日志</button>
       <button data-tab="settings">设置</button>
@@ -226,6 +243,8 @@ footer b{color:var(--ink-2)}
       <section id="tab-overview" class="active"></section>
       <section id="tab-sites"></section>
       <section id="tab-models"></section>
+      <section id="tab-groups"></section>
+      <section id="tab-chat"></section>
       <section id="tab-keys"></section>
       <section id="tab-logs"></section>
       <section id="tab-settings"></section>
@@ -954,6 +973,297 @@ function importCfg(input) {
     input.value = '';
   };
   reader.readAsText(f);
+}
+
+/* ============ 统一模型 ============ */
+
+let CUR_GROUP = null;
+let SITE_MODELS = {};
+
+RENDER.groups = async function () {
+  const el = $('#tab-groups');
+  try {
+    SITES = await api('/sites');
+    const gs = await api('/groups');
+    const rows = gs.map(g => {
+      const live = g.live_nodes > 0
+        ? `<span class="tag ok">${g.live_nodes} 个可用节点</span>`
+        : '<span class="tag err">无可用节点</span>';
+      return `<tr>
+        <td><b class="mono" style="font-size:13px">${esc(g.name)}</b>${
+          g.display ? `<br><span class="muted">${esc(g.display)}</span>` : ''}</td>
+        <td>${live}${g.enabled ? '' : ' <span class="tag dim">已停用</span>'}${
+          g.is_public ? ' <span class="tag acc">对外可见</span>' : ' <span class="tag dim">仅内部</span>'}</td>
+        <td>${g.nodes}</td>
+        <td class="mono">${esc(g.strategy || '继承全局')}</td>
+        <td class="muted" style="max-width:180px">${esc(g.note || '')}</td>
+        <td class="nowrap">
+          <button class="sm primary" onclick="openGroup('${jsq(g.name)}')">管理节点</button>
+          <button class="sm" onclick="editGroup('${jsq(g.name)}')">编辑</button>
+          <button class="sm danger" onclick="delGroup('${jsq(g.name)}', ${g.nodes})">删除</button>
+        </td></tr>`;
+    }).join('');
+
+    el.innerHTML = `
+      <div class="card glass">
+        <div class="card-head"><h2>统一模型是什么</h2></div>
+        <div class="note">
+          客户端只认 <b>一个模型名</b>（比如 <code>auto</code>），后台替它决定用哪个站的哪个真实模型。<br>
+          一个统一模型 = 一串<b>有序节点</b>，每个节点是「某站点 + 该站上真实存在的模型名」。<br>
+          请求按节点顺序依次尝试，失败自动换下一个，连续失败的节点进入冷却。<br>
+          不同站点给同一个模型起了不同名字也没关系 —— <b>手动绑成同一个统一模型</b>即可，
+          这里不做任何靠字符串相似度的自动归并。
+        </div>
+      </div>
+      <div class="card glass">
+        <div class="card-head">
+          <h2>统一模型（${gs.length}）</h2>
+          <button class="primary" onclick="newGroup()">新建统一模型</button>
+        </div>
+        <div class="scroll"><table>
+          <thead><tr><th>统一模型名</th><th>状态</th><th>节点数</th><th>策略</th><th>备注</th><th>操作</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="6" class="empty">还没有统一模型。点右上角新建一个，名字例如 auto</td></tr>'}</tbody>
+        </table></div>
+      </div>`;
+  } catch (e) { el.innerHTML = `<div class="card glass empty">加载失败：${esc(e.message)}</div>`; }
+};
+
+function nodeStateTag(n) {
+  if (n.state === 'cooling') return `<span class="tag warn">冷却中 ${n.cooldown_left}s</span>`;
+  if (n.state === 'disabled') return '<span class="tag dim">已停用</span>';
+  if (n.state === 'error') return '<span class="tag err">最近失败</span>';
+  return '<span class="tag ok">正常</span>';
+}
+
+function newGroup() {
+  openSheet('新建统一模型', `
+    <div class="row">
+      <div><label>统一模型名（客户端就用这个名字请求）</label><input id="g-name" placeholder="auto / cheap / coding"></div>
+      <div><label>显示名（可空）</label><input id="g-display" placeholder="自动选择"></div>
+    </div>
+    <div class="row gap">
+      <div><label>策略</label><select id="g-strategy">
+        <option value="">继承全局设置</option>
+        <option value="priority">priority — 严格按节点顺序</option>
+        <option value="balanced">balanced — 按剩余额度加权</option>
+        <option value="round_robin">round_robin — 轮流</option></select></div>
+      <div><label>对外可见</label><select id="g-public">
+        <option value="1">是（出现在 /v1/models）</option>
+        <option value="0">否（只内部使用）</option></select></div>
+      <div><label>备注</label><input id="g-note"></div>
+    </div>`,
+    `<button onclick="closeSheet()">取消</button>
+     <button class="primary" onclick="doNewGroup()">创建</button>`);
+}
+
+async function doNewGroup() {
+  const payload = {
+    name: $('#g-name').value.trim(), display: $('#g-display').value.trim(),
+    strategy: $('#g-strategy').value, is_public: $('#g-public').value === '1',
+    note: $('#g-note').value.trim()
+  };
+  if (!payload.name) return toast('统一模型名必填', 'err');
+  try {
+    await api('/groups', { method: 'POST', body: JSON.stringify(payload) });
+    toast('已创建，接着给它加节点', 'ok');
+    CUR_GROUP = payload.name;
+    await RENDER.groups();
+    drawGroupSheet();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function editGroup(name) {
+  const gs = await api('/groups');
+  const g = gs.find(x => x.name === name); if (!g) return;
+  const sel = (v) => g.strategy === v ? 'selected' : '';
+  openSheet('编辑统一模型 ' + name, `
+    <div class="row">
+      <div><label>统一模型名（改名会带着节点一起改）</label><input id="ge-name" value="${esc(g.name)}"></div>
+      <div><label>显示名</label><input id="ge-display" value="${esc(g.display || '')}"></div>
+    </div>
+    <div class="row gap">
+      <div><label>策略</label><select id="ge-strategy">
+        <option value="" ${sel('')}>继承全局设置</option>
+        <option value="priority" ${sel('priority')}>priority — 严格按节点顺序</option>
+        <option value="balanced" ${sel('balanced')}>balanced — 按剩余额度加权</option>
+        <option value="round_robin" ${sel('round_robin')}>round_robin — 轮流</option></select></div>
+      <div><label>启用</label><select id="ge-enabled">
+        <option value="1" ${g.enabled ? 'selected' : ''}>启用</option>
+        <option value="0" ${g.enabled ? '' : 'selected'}>停用</option></select></div>
+      <div><label>对外可见</label><select id="ge-public">
+        <option value="1" ${g.is_public ? 'selected' : ''}>是</option>
+        <option value="0" ${g.is_public ? '' : 'selected'}>否</option></select></div>
+      <div><label>备注</label><input id="ge-note" value="${esc(g.note || '')}"></div>
+    </div>`,
+    `<button onclick="closeSheet()">取消</button>
+     <button class="primary" onclick="doEditGroup('${jsq(name)}')">保存</button>`);
+}
+
+async function doEditGroup(name) {
+  const payload = {
+    name: $('#ge-name').value.trim(), display: $('#ge-display').value.trim(),
+    strategy: $('#ge-strategy').value, enabled: $('#ge-enabled').value === '1',
+    is_public: $('#ge-public').value === '1', note: $('#ge-note').value.trim()
+  };
+  try {
+    await api('/groups/' + encodeURIComponent(name), { method: 'PUT', body: JSON.stringify(payload) });
+    toast('已保存', 'ok'); closeSheet(); RENDER.groups();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function delGroup(name, nodes) {
+  const msg = nodes > 0
+    ? `「${name}」下面还有 ${nodes} 个节点，会一起删掉。继续？`
+    : `删除统一模型「${name}」？`;
+  if (!confirm(msg)) return;
+  try {
+    await api('/groups/' + encodeURIComponent(name) + (nodes > 0 ? '?nodes=1' : ''),
+      { method: 'DELETE' });
+    toast('已删除', 'ok'); RENDER.groups();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function openGroup(name) {
+  CUR_GROUP = name;
+  await drawGroupSheet();
+}
+
+async function drawGroupSheet() {
+  const gs = await api('/groups');
+  const g = gs.find(x => x.name === CUR_GROUP);
+  const nodes = await api('/groups/' + encodeURIComponent(CUR_GROUP) + '/nodes');
+  const rows = nodes.map(n => `<tr class="noderow" draggable="true" data-id="${n.id}">
+      <td class="drag" title="按住上下拖动排序">≡</td>
+      <td>${n.node_priority}</td>
+      <td><b>${esc(n.site_name)}</b>${n.site_enabled ? '' : ' <span class="tag dim">站点停用</span>'}</td>
+      <td class="mono">${esc(n.real_model)}</td>
+      <td>${nodeStateTag(n)}</td>
+      <td class="nowrap">${n.last_ok_at ? fmtTime(n.last_ok_at) : '-'}</td>
+      <td class="nowrap">${n.last_latency_ms || 0} ms</td>
+      <td class="nowrap"><span class="tag ok">${n.ok_count}</span> <span class="tag err">${n.fail_count}</span></td>
+      <td class="muted" style="max-width:180px" title="${esc(n.last_error || '')}">${esc((n.last_error || '').slice(0, 46))}</td>
+      <td class="nowrap">
+        <button class="sm" onclick="toggleNode(${n.id},${n.node_enabled ? 0 : 1})">${n.node_enabled ? '停用' : '启用'}</button>
+        <button class="sm" onclick="resetNode(${n.id})">重置</button>
+        <button class="sm danger" onclick="delNode(${n.id})">移除</button>
+      </td></tr>`).join('');
+
+  openSheet('统一模型 ' + CUR_GROUP + (g ? `（${esc(g.strategy || '继承全局')}）` : ''), `
+    <div class="note" style="margin-bottom:14px">
+      节点顺序就是尝试顺序。按住左边的 <b>≡</b> 上下拖动，松手立刻保存生效。
+      ${g && g.strategy === 'priority' ? '<b>当前策略 priority：请求严格按这个顺序走。</b>' : ''}
+      ${g && !g.is_public ? '<br>该统一模型标记为「仅内部」，不会出现在 /v1/models 里。' : ''}
+    </div>
+    <div class="scroll"><table>
+      <thead><tr><th></th><th>序</th><th>站点</th><th>真实模型</th><th>状态</th>
+        <th>最近成功</th><th>响应</th><th>成/败</th><th>最近错误</th><th>操作</th></tr></thead>
+      <tbody id="node-body">${rows || '<tr><td colspan="10" class="empty">还没有节点，用下面的表单添加</td></tr>'}</tbody>
+    </table></div>
+    <hr>
+    <div style="font-size:13px;font-weight:600;margin-bottom:12px">添加节点</div>
+    <div class="row">
+      <div><label>中转站</label><select id="n-site" onchange="loadSiteModels()">
+        ${SITES.map(s => `<option value="${s.id}">${esc(s.name)}</option>`).join('')}</select></div>
+      <div><label>该站上的真实模型名</label>
+        <input id="n-model" list="n-model-list" placeholder="例如 claude-sonnet-4-5">
+        <datalist id="n-model-list"></datalist></div>
+      <div style="max-width:170px"><label>每日上限（0=不限）</label><input id="n-limit" type="number" value="0"></div>
+    </div>
+    <div class="gap">
+      <button onclick="loadSiteModels(true)">拉取该站模型列表</button>
+      <button class="primary" onclick="addNode()">添加节点</button>
+      <span class="muted" style="margin-left:8px">同一个「站点 × 模型」在一个统一模型里只能出现一次</span>
+    </div>`, '');
+
+  initDrag($('#node-body'));
+  loadSiteModels();
+}
+
+async function loadSiteModels(force) {
+  const sel = $('#n-site'); if (!sel) return;
+  const sid = parseInt(sel.value, 10);
+  if (!sid) return;
+  try {
+    if (force) {
+      const r = await api('/models/scan', { method: 'POST' });
+      const me = (r || []).find(x => x.site_id === sid);
+      if (me && me.ok) { SITE_MODELS[sid] = me.models; toast(`拉到 ${me.models.length} 个模型`, 'ok'); }
+      else toast((me && me.error) || '拉取失败，可以手动填', 'err');
+    } else if (!SITE_MODELS[sid]) {
+      const r = await api('/sites/' + sid + '/models');
+      SITE_MODELS[sid] = r.models || [];
+    }
+    const dl = $('#n-model-list');
+    if (dl) dl.innerHTML = (SITE_MODELS[sid] || []).map(m => `<option value="${esc(m)}">`).join('');
+  } catch (e) { /* 拉不到就让用户手填 */ }
+}
+
+async function addNode() {
+  const site_id = parseInt($('#n-site').value, 10);
+  const upstream_model = $('#n-model').value.trim();
+  if (!upstream_model) return toast('真实模型名必填', 'err');
+  try {
+    await api('/groups/' + encodeURIComponent(CUR_GROUP) + '/nodes', {
+      method: 'POST',
+      body: JSON.stringify({ site_id, upstream_model,
+        daily_limit: parseInt($('#n-limit').value || '0', 10) })
+    });
+    toast('已添加', 'ok');
+    await drawGroupSheet();
+    RENDER.groups();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function toggleNode(id, enabled) {
+  try {
+    await api('/groups/nodes/' + id, { method: 'PUT', body: JSON.stringify({ enabled: !!enabled }) });
+    await drawGroupSheet(); RENDER.groups();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function resetNode(id) {
+  try {
+    await api('/groups/nodes/' + id + '/reset', { method: 'POST' });
+    toast('已重置冷却', 'ok'); await drawGroupSheet();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function delNode(id) {
+  if (!confirm('移除该节点？')) return;
+  try {
+    await api('/groups/nodes/' + id, { method: 'DELETE' });
+    toast('已移除', 'ok'); await drawGroupSheet(); RENDER.groups();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+function initDrag(tbody) {
+  if (!tbody) return;
+  let dragging = null;
+  $$('.noderow', tbody).forEach(tr => {
+    tr.ondragstart = () => { dragging = tr; tr.classList.add('dragging'); };
+    tr.ondragover = e => {
+      e.preventDefault();
+      if (!dragging || dragging === tr) return;
+      const r = tr.getBoundingClientRect();
+      const after = (e.clientY - r.top) / r.height > 0.5;
+      tbody.insertBefore(dragging, after ? tr.nextSibling : tr);
+    };
+    tr.ondragend = () => {
+      tr.classList.remove('dragging');
+      if (dragging) { dragging = null; commitOrder(tbody); }
+    };
+  });
+}
+
+async function commitOrder(tbody) {
+  if (!CUR_GROUP) return;
+  const ids = $$('.noderow', tbody).map(x => parseInt(x.dataset.id, 10));
+  try {
+    await api('/groups/' + encodeURIComponent(CUR_GROUP) + '/order',
+      { method: 'POST', body: JSON.stringify({ ids }) });
+    toast('顺序已保存', 'ok');
+    await drawGroupSheet();
+  } catch (e) { toast(e.message, 'err'); }
 }
 
 /* ============ 启动 ============ */

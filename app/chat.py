@@ -24,6 +24,25 @@ class UpstreamFailed(Exception):
         self.attempts = attempts or []
 
 
+class UpstreamRejected(UpstreamFailed):
+    """上游明确拒绝了这次请求，但这不是节点的故障。
+
+    例如上下文超长、参数非法、内容审核。这种情况**不换节点**，直接把上游的
+    原始错误和状态码还给客户端，免得拿同一个错误把别的站点全试一遍、白白
+    消耗它们的额度。
+
+    继承自 UpstreamFailed，这样各入口原有的 `except UpstreamFailed` 依然兜得住；
+    需要精确处理的调用方把 `except UpstreamRejected` 写在前面即可。
+    """
+
+    def __init__(self, status, body, site_name="", kind="bad_request"):
+        super().__init__(f"{site_name}: HTTP {status} {body}")
+        self.status = int(status or 400)
+        self.body = body or ""
+        self.site_name = site_name
+        self.kind = kind
+
+
 # ------------------------------------------------------------------ SSE 解析
 
 class SSEParser:
@@ -140,14 +159,22 @@ class StreamEvent:
 
 def write_log(*, site=None, model="", upstream_model="", key_info=None, attempt=1, ok=0,
               status_code=None, latency_ms=0, usage=None, stream=0, error="",
-              cached=0, endpoint="openai"):
+              cached=0, endpoint="openai", switches=0, stream_phase=""):
+    """写一条请求日志。
+
+    stream_phase 用来区分流式请求的三种收尾方式：
+      ""      非流式
+      "ok"    流式正常结束
+      "pre"   开始输出之前就失败，已经切换到别的节点
+      "post"  已经把内容发给客户端之后中途断流，按设计不重试、不换节点
+    """
     u = usage or {}
     db.execute(
         """INSERT INTO request_logs
            (ts, site_id, site_name, model, upstream_model, key_id, key_name, attempt, ok,
             cached, endpoint, status_code, latency_ms,
-            prompt_tokens, completion_tokens, total_tokens, stream, error)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            prompt_tokens, completion_tokens, total_tokens, stream, switches, stream_phase, error)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             time.time(),
             site["site_id"] if site else None,
@@ -160,7 +187,7 @@ def write_log(*, site=None, model="", upstream_model="", key_info=None, attempt=
             int(u.get("prompt_tokens") or 0),
             int(u.get("completion_tokens") or 0),
             int(u.get("total_tokens") or 0),
-            stream, str(error)[:1000],
+            stream, int(switches or 0), str(stream_phase or ""), str(error)[:1000],
         ),
     )
 
@@ -168,15 +195,15 @@ def write_log(*, site=None, model="", upstream_model="", key_info=None, attempt=
 # ------------------------------------------------------------------ 候选
 
 def _candidates(model):
-    strategy = db.get_setting("strategy", "balanced")
+    """取出这个统一模型下可以尝试的节点，并按策略排好序。"""
     max_attempts = int(db.get_setting("max_attempts", 3) or 3)
     cands = engine.get_candidates(model)
     if not cands:
         raise NoUpstream(
             f"没有可用上游支持模型 {model}",
-            available=engine.available_models(),
+            available=engine.public_models() or engine.available_models(),
         )
-    engine.sort_candidates(cands, strategy)
+    engine.sort_candidates(cands, engine.group_strategy(model))
     return cands, max_attempts
 
 
@@ -232,6 +259,7 @@ async def complete(client, body, key_info, endpoint="openai"):
     cands, max_attempts = _candidates(model)
     last_err = "未知错误"
     attempts = []
+    switches = 0
 
     for attempt, site in enumerate(cands[:max_attempts], start=1):
         payload = _upstream_payload(body, site)
@@ -246,12 +274,15 @@ async def complete(client, body, key_info, endpoint="openai"):
                 headers=engine.upstream_headers(site),
             )
         except Exception as e:
+            latency = int((time.time() - t0) * 1000)
             engine.record_failure(site["site_id"], e)
+            engine.record_node_failure(site.get("route_id"), f"连接失败: {e}")
             write_log(site=site, model=model, upstream_model=payload.get("model"),
                       key_info=key_info, attempt=attempt, ok=0, endpoint=endpoint,
-                      latency_ms=int((time.time() - t0) * 1000), error=f"连接失败: {e}")
+                      latency_ms=latency, switches=switches, error=f"连接失败: {e}")
             last_err = f"{site['name']}: {e}"
             attempts.append(last_err)
+            switches += 1
             continue
 
         latency = int((time.time() - t0) * 1000)
@@ -260,53 +291,90 @@ async def complete(client, body, key_info, endpoint="openai"):
                 data = r.json()
             except Exception as e:
                 engine.record_failure(site["site_id"], f"返回非 JSON: {e}")
+                engine.record_node_failure(site.get("route_id"), "返回非 JSON")
                 write_log(site=site, model=model, upstream_model=payload.get("model"),
                           key_info=key_info, attempt=attempt, ok=0, endpoint=endpoint,
-                          status_code=200, latency_ms=latency, error="返回非 JSON")
+                          status_code=200, latency_ms=latency, switches=switches,
+                          error=f"返回非 JSON: {e}")
                 last_err = f"{site['name']}: 返回非 JSON"
                 attempts.append(last_err)
+                switches += 1
                 continue
             engine.record_success(site["site_id"])
+            engine.record_node_success(site.get("route_id"), latency)
             write_log(site=site, model=model, upstream_model=payload.get("model"),
                       key_info=key_info, attempt=attempt, ok=1, endpoint=endpoint,
-                      status_code=200, latency_ms=latency, usage=data.get("usage"))
+                      status_code=200, latency_ms=latency, usage=data.get("usage"),
+                      switches=switches)
             store(key, body, data, stream=False)
             return data, False
 
         err_text = (r.text or "")[:500]
+        retryable, kind = engine.classify_error(r.status_code, err_text)
+
+        if not retryable:
+            # 这次请求本身的问题（上下文超长 / 参数非法 / 内容审核），
+            # 换哪个站都是同样的结果，不浪费其它站点的额度，直接还给客户端。
+            write_log(site=site, model=model, upstream_model=payload.get("model"),
+                      key_info=key_info, attempt=attempt, ok=0, endpoint=endpoint,
+                      status_code=r.status_code, latency_ms=latency, switches=switches,
+                      error=err_text or f"HTTP {r.status_code}")
+            raise UpstreamRejected(r.status_code, err_text, site["name"], kind)
+
         engine.record_failure(site["site_id"], f"{r.status_code} {err_text}")
+        engine.record_node_failure(site.get("route_id"), f"{r.status_code} {err_text}")
         write_log(site=site, model=model, upstream_model=payload.get("model"),
                   key_info=key_info, attempt=attempt, ok=0, endpoint=endpoint,
-                  status_code=r.status_code, latency_ms=latency, error=err_text)
+                  status_code=r.status_code, latency_ms=latency, switches=switches,
+                  error=err_text or f"HTTP {r.status_code}")
         last_err = f"{site['name']}: HTTP {r.status_code} {err_text}"
         attempts.append(last_err)
+        switches += 1
 
     raise UpstreamFailed(f"所有上游均失败。最后错误：{last_err}", attempts)
 
 
 # ================================================================== 流式
 
-async def stream(client, body, key_info, endpoint="openai", holder=None):
+def _sse_bytes(obj):
+    """把一个 JSON 对象序列化成一段标准 SSE data 行。"""
+    return ("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode("utf-8")
+
+
+async def stream(client, body, key_info, endpoint="openai", holder=None, rewrite=False):
     """向上游发起流式请求，逐段吐出 StreamEvent。
 
-    成功结束后会把完整响应写入 holder["final"]，供上层回写缓存。
-    注意：一旦开始往客户端吐字节，就不能再切换上游。
+    分两个阶段，分界线是「有没有往客户端吐过字节」：
+
+      阶段一（还没开吐）：连接失败 / 超时 / HTTP 错误 / 还没输出就断了
+          -> 允许换下一个节点，日志记 stream_phase="pre"
+
+      阶段二（只要吐过一个字节）：立刻锁定当前节点
+          -> 中途断流不重试、不换节点，正常结束连接，日志记 stream_phase="post"
+             这是设计而不是 bug：换节点会产生重复内容或两个模型的答案拼接。
+
+    rewrite=True 时会把上游回包里的 model 字段改写成客户端请求的统一模型名
+    （让客户端始终只看到 auto 这类统一模型名），并负责补发 [DONE]。
     """
     holder = holder if holder is not None else {}
-    holder["ok"] = False
-    holder["final"] = None
-    holder["site"] = None
+    holder.update(ok=False, final=None, site=None, phase="", switches=0, breaker="")
 
     model = body.get("model")
     cands, max_attempts = _candidates(model)
     inject_usage = bool(db.get_setting("inject_stream_usage", True))
-    last_err = "未知错误"
+    do_rewrite = bool(rewrite) and bool(db.get_setting("rewrite_model", True))
+    allow_switch = bool(db.get_setting("switch_before_output", True))
+
     attempts = []
+    last_err = "未知错误"
+    switches = 0
+    tried = 0
 
     for site in cands:
-        if len(attempts) >= max_attempts:
+        if tried >= max_attempts:
             break
-        attempt = len(attempts) + 1
+        tried += 1
+        attempt = tried
 
         payload = _upstream_payload(body, site)
         payload["stream"] = True
@@ -319,6 +387,8 @@ async def stream(client, body, key_info, endpoint="openai", holder=None):
 
         engine.incr_today_count(site["site_id"], model)
         t0 = time.time()
+
+        # ============== 阶段一：还没向客户端输出过任何字节 ==============
         try:
             req = client.build_request(
                 "POST",
@@ -328,13 +398,16 @@ async def stream(client, body, key_info, endpoint="openai", holder=None):
             )
             resp = await client.send(req, stream=True)
         except Exception as e:
+            latency = int((time.time() - t0) * 1000)
             engine.record_failure(site["site_id"], e)
+            engine.record_node_failure(site.get("route_id"), f"连接失败: {e}")
             write_log(site=site, model=model, upstream_model=payload.get("model"),
                       key_info=key_info, attempt=attempt, ok=0, endpoint=endpoint,
-                      stream=1, latency_ms=int((time.time() - t0) * 1000),
-                      error=f"连接失败: {e}")
+                      stream=1, stream_phase="pre", latency_ms=latency,
+                      switches=switches, error=f"连接失败: {e}")
             last_err = f"{site['name']}: {e}"
             attempts.append(last_err)
+            switches += 1
             continue
 
         if resp.status_code != 200:
@@ -343,46 +416,109 @@ async def stream(client, body, key_info, endpoint="openai", holder=None):
             except Exception:
                 txt = ""
             await resp.aclose()
+            latency = int((time.time() - t0) * 1000)
+            retryable, kind = engine.classify_error(resp.status_code, txt)
+
+            if not retryable:
+                # 请求本身的问题，换节点也是同样结果，直接还给客户端
+                write_log(site=site, model=model, upstream_model=payload.get("model"),
+                          key_info=key_info, attempt=attempt, ok=0, endpoint=endpoint,
+                          stream=1, stream_phase="pre", status_code=resp.status_code,
+                          latency_ms=latency, switches=switches,
+                          error=txt or f"HTTP {resp.status_code}")
+                raise UpstreamRejected(resp.status_code, txt, site["name"], kind)
+
             engine.record_failure(site["site_id"], f"{resp.status_code} {txt}")
+            engine.record_node_failure(site.get("route_id"), f"{resp.status_code} {txt}")
             write_log(site=site, model=model, upstream_model=payload.get("model"),
                       key_info=key_info, attempt=attempt, ok=0, endpoint=endpoint,
-                      stream=1, status_code=resp.status_code,
-                      latency_ms=int((time.time() - t0) * 1000), error=txt)
+                      stream=1, stream_phase="pre", status_code=resp.status_code,
+                      latency_ms=latency, switches=switches,
+                      error=txt or f"HTTP {resp.status_code}")
             last_err = f"{site['name']}: HTTP {resp.status_code} {txt}"
             attempts.append(last_err)
+            switches += 1
             continue
 
-        # ---- 拿到 200，开始转发（此后不可再切换）----
+        # ============== 阶段二：拿到 200，开始转发 ==============
+        # 从这里开始，只要往客户端吐过一个字节，就锁定这个节点，绝不再换。
         engine.record_success(site["site_id"])
         parser = SSEParser()
         acc = Accumulator(model)
+        started = False      # 有没有已经吐给客户端字节
         broken = False
+        break_err = ""
+
         try:
             async for chunk in resp.aiter_bytes():
-                for obj in parser.feed(chunk):
+                objs = parser.feed(chunk)
+                for obj in objs:
                     acc.feed(obj)
-                yield StreamEvent(chunk, None)
+
+                if not do_rewrite:
+                    if chunk:
+                        started = True
+                        yield StreamEvent(chunk, None)
+                    continue
+
+                # 改写 model：按对象重新序列化，仍是标准 SSE，客户端无感
+                for obj in objs:
+                    if isinstance(obj, dict) and obj.get("model"):
+                        obj["model"] = model
+                    started = True
+                    yield StreamEvent(_sse_bytes(obj), None)
         except Exception as e:
             broken = True
-            last_err = f"{site['name']} 传输中断: {e}"
+            break_err = f"传输中断: {e}"
+        finally:
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
+
+        latency = int((time.time() - t0) * 1000)
+
+        if broken:
+            if started:
+                # 已经开始输出 -> 按设计不重试、不换节点，只记录「流式输出后断流」
+                engine.record_failure(site["site_id"], break_err)
+                engine.record_node_failure(site.get("route_id"), break_err)
+                write_log(site=site, model=model, upstream_model=payload.get("model"),
+                          key_info=key_info, attempt=attempt, ok=0, endpoint=endpoint,
+                          stream=1, stream_phase="post", status_code=200,
+                          latency_ms=latency, switches=switches, error=break_err)
+                holder["phase"] = "post"
+                holder["switches"] = switches
+                holder["breaker"] = break_err
+                return
+            # 还没吐过任何字节 -> 这次断流等价于连接失败，可以换下一个节点
+            engine.record_failure(site["site_id"], break_err)
+            engine.record_node_failure(site.get("route_id"), break_err)
             write_log(site=site, model=model, upstream_model=payload.get("model"),
                       key_info=key_info, attempt=attempt, ok=0, endpoint=endpoint,
-                      stream=1, status_code=200,
-                      latency_ms=int((time.time() - t0) * 1000),
-                      error=f"传输中断: {e}")
-        finally:
-            await resp.aclose()
+                      stream=1, stream_phase="pre", status_code=200,
+                      latency_ms=latency, switches=switches, error=break_err)
+            last_err = f"{site['name']}: {break_err}"
+            attempts.append(last_err)
+            switches += 1
+            if not allow_switch:
+                break
+            continue
 
-        if not broken:
-            final = acc.result()
-            write_log(site=site, model=model, upstream_model=payload.get("model"),
-                      key_info=key_info, attempt=attempt, ok=1, endpoint=endpoint,
-                      stream=1, status_code=200,
-                      latency_ms=int((time.time() - t0) * 1000),
-                      usage=final.get("usage"))
-            holder["final"] = final
-            holder["ok"] = True
-            holder["site"] = site["name"]
+        # ---- 正常结束 ----
+        if do_rewrite:
+            yield StreamEvent(b"data: [DONE]\n\n", None)
+        final = acc.result()
+        engine.record_node_success(site.get("route_id"), latency)
+        write_log(site=site, model=model, upstream_model=payload.get("model"),
+                  key_info=key_info, attempt=attempt, ok=1, endpoint=endpoint,
+                  stream=1, stream_phase="ok", status_code=200,
+                  latency_ms=latency, usage=final.get("usage"), switches=switches)
+        holder["final"] = final
+        holder["ok"] = True
+        holder["site"] = site["name"]
+        holder["phase"] = "ok"
+        holder["switches"] = switches
         return
 
     raise UpstreamFailed(f"所有上游均失败。最后错误：{last_err}", attempts)

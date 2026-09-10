@@ -253,8 +253,17 @@ def _stop_reason(choice):
     return choice.get("finish_reason") or "stop"
 
 
-def openai_to_openai_response(u):
-    return u
+def openai_to_openai_response(u, model=None):
+    """把回包里的 model 字段改写成客户端请求的统一模型名。
+
+    客户端请求的是 auto，后台真实可能用掉了 C站/gemini-2.5-pro；客户端
+    没必要知道，让它始终只看到 auto。真实站点与真实模型在面板日志里能看到。
+    """
+    if not isinstance(u, dict) or not model:
+        return u
+    out = dict(u)
+    out["model"] = model
+    return out
 
 
 def openai_to_anthropic(u, model=None):
@@ -395,6 +404,30 @@ def openai_to_responses(u, model=None):
         "truncation": "disabled",
         "user": None,
     }
+
+
+def upstream_error_payload(body, kind, status, site_name=""):
+    """把上游的错误正文尽可能原样还给客户端。
+
+    上游本来就是 OpenAI 兼容的，它的 {"error": {...}} 直接透传对客户端最友好
+    （Cherry Studio / RikkaHub 这类客户端能正确显示）；
+    解析不出来才退化成我们自己包的壳，避免客户端拿到一坨转义字符串。
+    """
+    obj = None
+    if isinstance(body, str) and body.strip():
+        try:
+            obj = json.loads(body)
+        except Exception:
+            obj = None
+    if isinstance(obj, dict) and isinstance(obj.get("error"), dict):
+        err = dict(obj["error"])
+        err.setdefault("type", kind)
+        if site_name:
+            err.setdefault("upstream_site", site_name)
+        return {"error": err}
+    return {"error": {"message": body or "上游拒绝了这次请求",
+                      "type": kind, "code": status,
+                      "upstream_site": site_name}}
 
 
 RENDERERS = {

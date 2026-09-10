@@ -1,0 +1,33 @@
+# 依赖 / 编译产物
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+node_modules/
+
+# 数据目录与 SQLite（里面有真实中转站 API Key，绝对不能提交）
+data/
+/data/
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# 环境变量
+.env
+.env.*
+!.env.example
+
+# 导出/备份文件（完整备份含敏感 Key）
+relayhub-backup*.json
+*backup*.json
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log

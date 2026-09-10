@@ -11,11 +11,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 
 from . import cache, chat, db, engine, formats as fm, models_sync, quota, security
-from .config import CONNECT_TIMEOUT, REQUEST_TIMEOUT
+from .config import CONNECT_TIMEOUT, REQUEST_TIMEOUT, persistence_report
 from .db import DEFAULT_SETTINGS
 
 STATIC_DIR = Path(__file__).parent / "static"
-VERSION = "0.4.1"
+VERSION = "0.5.0"
 
 SSE_HEADERS = {
     "Cache-Control": "no-cache",
@@ -24,11 +24,31 @@ SSE_HEADERS = {
 }
 
 
+_PERSISTENCE_INFO = {}
+
+
+def _report_persistence():
+    """启动时体检数据目录：明显不安全就大声喊出来，绝不静默运行。"""
+    global _PERSISTENCE_INFO
+    info = persistence_report()
+    print("=" * 64, flush=True)
+    print(f"[RelayHub] 数据目录 : {info['resolved']}", flush=True)
+    print(f"[RelayHub] 数据库   : {info['db_path']}", flush=True)
+    print("[RelayHub] 持久卷   : " +
+          ("是（检测到独立挂载点）" if info["is_mount"] else "未检测到独立挂载点"), flush=True)
+    if info["warning"]:
+        print("[RelayHub] ⚠  " + info["warning"], flush=True)
+    print("=" * 64, flush=True)
+    _PERSISTENCE_INFO = info
+    return info
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
     security.seed_admin()
     cache.purge_expired()
+    _report_persistence()
     app.state.client = httpx.AsyncClient(
         timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=CONNECT_TIMEOUT),
         limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
@@ -190,6 +210,13 @@ async def handle(request: Request, endpoint, model_action=None):
         except chat.NoUpstream as e:
             avail = "、".join(e.available) if e.available else "（空）"
             raise HTTPException(503, f"没有可用上游支持模型 {model}。已配置模型：{avail}")
+        except chat.UpstreamRejected as e:
+            # 请求本身的问题（上下文超长 / 参数非法 / 内容审核）。
+            # 没有拿同一个错误去把其它站点试一遍，把上游的原话还给客户端。
+            return JSONResponse(
+                fm.upstream_error_payload(e.body, e.kind, e.status, e.site_name),
+                status_code=e.status if 400 <= e.status < 600 else 400,
+            )
         except chat.UpstreamFailed as e:
             raise HTTPException(502, str(e))
         return JSONResponse(fm.RENDERERS[endpoint](unified_resp, model))
@@ -206,12 +233,21 @@ async def _render_stream(endpoint, client, unified, key_info, model, key):
 
     if endpoint == "openai":
         try:
-            async for ev in chat.stream(client, unified, key_info, endpoint, holder):
+            # rewrite=True：上游回包里的 model 字段统一改写成客户端请求的
+            # 统一模型名（auto 这类），客户端永远看不到真实站点模型名。
+            async for ev in chat.stream(client, unified, key_info, endpoint, holder,
+                                        rewrite=True):
                 yield ev.raw
+        except chat.UpstreamRejected as e:
+            pl = fm.upstream_error_payload(e.body, e.kind, e.status, e.site_name)
+            yield _error_payload(endpoint, (pl.get("error") or {}).get("message")
+                                 or "上游拒绝了这次请求")
         except (chat.UpstreamFailed, chat.NoUpstream) as e:
             yield _error_payload(endpoint, str(e))
         else:
-            chat.store(key, unified, holder.get("final"), stream=True)
+            # 只有正常收尾才回写缓存；中途断流不回写，避免缓存半个答案
+            if holder.get("ok"):
+                chat.store(key, unified, holder.get("final"), stream=True)
         return
 
     parser = chat.SSEParser()
@@ -453,13 +489,18 @@ async def ep_gemini_v1(model_action: str, request: Request):
 
 @app.get("/v1/models")
 async def list_models(request: Request):
+    """对外暴露的是「统一模型」，不是上游站点的真实模型名。
+
+    只返回：统一模型启用 + 标记为公开 + 至少有一个可用节点。
+    真实模型名只用于后台路由，不会因为「配置过路由」就泄露给客户端。
+    """
     auth_api_key(request)
     now = int(time.time())
     return {
         "object": "list",
         "data": [
             {"id": m, "object": "model", "created": now, "owned_by": "relayhub"}
-            for m in engine.available_models()
+            for m in engine.public_models()
         ],
     }
 
@@ -547,34 +588,109 @@ async def cache_purge(request: Request):
 # -------- 配置备份
 
 @app.get("/admin/api/export")
-async def export_config(request: Request):
+async def export_config(request: Request, mode: str = "safe"):
+    """导出配置。
+
+    mode=safe （默认）**不含任何 API Key**，适合分享、普通备份。
+    mode=full 含中转站 Key 与网关 Key，属于敏感文件，别上传公开仓库。
+    """
     require_admin(request)
+    full = (mode or "safe").lower() in ("full", "all", "1", "true")
+    now = time.time()
+
     sites = []
     for row in db.query("SELECT * FROM sites ORDER BY id"):
         d = db.rowdict(row)
-        sites.append({
-            "name": d["name"], "base_url": d["base_url"], "api_key": d["api_key"],
+        item = {
+            "name": d["name"], "base_url": d["base_url"],
             "enabled": d["enabled"], "priority": d["priority"], "note": d["note"],
+        }
+        if full:
+            item["api_key"] = d["api_key"]
+        sites.append(item)
+
+    site_names = {r["id"]: r["name"] for r in db.query("SELECT id, name FROM sites")}
+    routes = []
+    for row in db.query("SELECT * FROM routes ORDER BY model, priority, id"):
+        d = db.rowdict(row)
+        routes.append({
+            "site_name": site_names.get(d["site_id"], ""),
+            "model": d["model"],
+            "upstream_model": d["upstream_model"],
+            "enabled": d["enabled"],
+            "daily_limit": d["daily_limit"],
+            "priority": d["priority"],
         })
-    routes = [db.rowdict(r) for r in db.query(
-        "SELECT site_id, model, upstream_model, enabled, daily_limit FROM routes")]
-    keys = [db.rowdict(r) for r in db.query(
-        "SELECT key, name, enabled, daily_limit, note FROM api_keys")]
-    return {
-        "version": 1,
+
+    groups = [db.rowdict(r) for r in db.query("SELECT * FROM model_groups ORDER BY name")]
+
+    keys = []
+    for row in db.query("SELECT * FROM api_keys ORDER BY id"):
+        d = db.rowdict(row)
+        item = {"name": d["name"], "enabled": d["enabled"],
+                "daily_limit": d["daily_limit"], "note": d["note"]}
+        if full:
+            item["key"] = d["key"]
+        keys.append(item)
+
+    return JSONResponse({
+        "version": 2,
         "app": "relayhub",
-        "exported_at": time.time(),
-        "settings": {k: db.get_setting(k) for k in DEFAULT_SETTINGS},
+        "mode": "full" if full else "safe",
+        "exported_at": now,
+        "settings": {k: db.get_setting(k, DEFAULT_SETTINGS.get(k)) for k in SETTING_KEYS},
         "sites": sites,
+        "groups": groups,
         "routes": routes,
         "keys": keys,
-    }
+    })
 
 
 @app.post("/admin/api/import")
 async def import_config(request: Request, payload: dict = Body(...)):
+    """导入配置。
+
+    strategy=merge（默认）  合并：同名覆盖，不同名新增，不动其它数据。
+    strategy=overwrite      覆盖：清空站点/路由/统一模型/密钥后整体写入，用于换机迁移。
+
+    关键安全保证：所有写入之前先做格式校验，格式不对直接 400 返回，
+    绝不会因为备份文件有问题就把现有数据库清空。
+    """
     require_admin(request)
     data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if not isinstance(data, dict):
+        raise HTTPException(400, "备份文件格式不正确：顶层必须是 JSON 对象")
+
+    strategy = str(payload.get("strategy") or data.get("strategy") or "merge").lower()
+    overwrite = strategy in ("overwrite", "replace", "覆盖")
+    strategy = "overwrite" if overwrite else "merge"
+
+    # ---- 先校验，再动数据库 ----
+    for field in ("sites", "routes", "groups", "keys"):
+        v = data.get(field)
+        if v is not None and not isinstance(v, list):
+            raise HTTPException(400, f"备份文件格式不正确：{field} 必须是数组")
+    if data.get("app") not in (None, "relayhub"):
+        raise HTTPException(400, f"这不是 RelayHub 的备份文件（app={data.get('app')}）")
+    sites_in = data.get("sites") or []
+    routes_in = data.get("routes") or []
+    for s in sites_in:
+        if not isinstance(s, dict) or not (s.get("name") or "").strip():
+            raise HTTPException(400, "备份文件格式不正确：存在没有名称的站点")
+    for r in routes_in:
+        if not isinstance(r, dict) or not (r.get("model") or "").strip():
+            raise HTTPException(400, "备份文件格式不正确：存在缺少 model 的路由")
+
+    # 覆盖导入时先把「同名站点的旧 Key」记下来：
+    # 安全备份文件里没有 API Key，要是不保留，用户一按覆盖就把自己的 Key 全清了。
+    old_keys = {}
+    if overwrite:
+        old_keys = {r["name"]: r["api_key"]
+                    for r in db.query("SELECT name, api_key FROM sites")}
+        db.execute("DELETE FROM routes")
+        db.execute("DELETE FROM model_groups")
+        db.execute("DELETE FROM api_keys")
+        db.execute("DELETE FROM sites")
 
     name_to_id = {}
     for s in data.get("sites") or []:
@@ -583,6 +699,9 @@ async def import_config(request: Request, payload: dict = Body(...)):
             continue
         base_url = (s.get("base_url") or "").strip()
         api_key = s.get("api_key") or ""
+        if not api_key and name in old_keys:
+            # 安全备份不带 Key，覆盖导入时沿用本机原来的 Key，避免静默丢密钥
+            api_key = old_keys[name]
         enabled = 1 if s.get("enabled", True) else 0
         priority = int(s.get("priority") or 100)
         note = s.get("note") or ""
@@ -599,6 +718,27 @@ async def import_config(request: Request, payload: dict = Body(...)):
                 (name, base_url, api_key, enabled, priority, note, time.time()))
             name_to_id[name] = cur.lastrowid
 
+    added_groups = 0
+    for g in data.get("groups") or []:
+        if not isinstance(g, dict):
+            continue
+        gname = (g.get("name") or "").strip()
+        if not gname:
+            continue
+        db.execute(
+            """INSERT INTO model_groups(name, display, enabled, is_public, strategy, note, created_at)
+               VALUES (?,?,?,?,?,?,?)
+               ON CONFLICT(name) DO UPDATE SET
+                 display=excluded.display, enabled=excluded.enabled,
+                 is_public=excluded.is_public, strategy=excluded.strategy,
+                 note=excluded.note""",
+            (gname, str(g.get("display") or ""),
+             1 if g.get("enabled", True) else 0,
+             1 if g.get("is_public", True) else 0,
+             (g.get("strategy") or "").strip(), str(g.get("note") or ""),
+             time.time()))
+        added_groups += 1
+
     site_by_id = {}
     for row in db.query("SELECT id, name FROM sites"):
         site_by_id[row["id"]] = row["name"]
@@ -612,13 +752,15 @@ async def import_config(request: Request, payload: dict = Body(...)):
         if not site_name or site_name not in name_to_id:
             continue
         db.execute(
-            """INSERT INTO routes(site_id, model, upstream_model, enabled, daily_limit)
-               VALUES (?,?,?,?,?)
+            """INSERT INTO routes(site_id, model, upstream_model, enabled, daily_limit, priority)
+               VALUES (?,?,?,?,?,?)
                ON CONFLICT(site_id, model) DO UPDATE SET
                  upstream_model=excluded.upstream_model,
-                 daily_limit=excluded.daily_limit, enabled=excluded.enabled""",
+                 daily_limit=excluded.daily_limit, enabled=excluded.enabled,
+                 priority=excluded.priority""",
             (name_to_id[site_name], model, (r.get("upstream_model") or "").strip(),
-             1 if r.get("enabled", True) else 0, int(r.get("daily_limit") or 0)))
+             1 if r.get("enabled", True) else 0, int(r.get("daily_limit") or 0),
+             int(r.get("priority") or (10 + added_routes * 10))))
         added_routes += 1
 
     added_keys = 0
@@ -637,8 +779,237 @@ async def import_config(request: Request, payload: dict = Body(...)):
         if k in DEFAULT_SETTINGS:
             db.set_setting(k, v)
 
-    return {"ok": True, "sites": len(data.get("sites") or []),
-            "routes": added_routes, "keys": added_keys}
+    return {"ok": True, "strategy": strategy, "sites": len(sites_in),
+            "groups": added_groups, "routes": added_routes, "keys": added_keys}
+
+
+# -------- 统一模型（客户端只认一个模型名 -> 内部是多站多真实模型）
+
+def _group_row(name):
+    return db.query_one("SELECT * FROM model_groups WHERE name=?", (name,))
+
+
+NODE_SQL = """
+SELECT r.id, r.site_id, r.model, r.upstream_model, r.enabled AS node_enabled,
+       r.daily_limit, r.priority AS node_priority, r.fail_streak, r.ok_count,
+       r.fail_count, r.last_error, r.last_ok_at, r.last_fail_at,
+       r.last_latency_ms, r.circuit_until,
+       s.name AS site_name, s.enabled AS site_enabled, s.priority AS site_priority,
+       s.circuit_until AS site_circuit_until
+FROM routes r JOIN sites s ON s.id = r.site_id
+WHERE r.model = ?
+ORDER BY r.priority, s.priority, r.id
+"""
+
+
+def _node_dict(row, now):
+    d = db.rowdict(row)
+    d["real_model"] = d["upstream_model"] or d["model"]
+    if d["circuit_until"] and d["circuit_until"] > now:
+        d["state"], d["cooldown_left"] = "cooling", int(d["circuit_until"] - now)
+    elif d["site_circuit_until"] and d["site_circuit_until"] > now:
+        d["state"], d["cooldown_left"] = "cooling", int(d["site_circuit_until"] - now)
+    elif not d["node_enabled"] or not d["site_enabled"]:
+        d["state"], d["cooldown_left"] = "disabled", 0
+    elif d["last_error"]:
+        d["state"], d["cooldown_left"] = "error", 0
+    else:
+        d["state"], d["cooldown_left"] = "ok", 0
+    return d
+
+
+@app.get("/admin/api/groups")
+async def list_groups(request: Request):
+    require_admin(request)
+    out = []
+    for row in db.query("SELECT * FROM model_groups ORDER BY name"):
+        g = db.rowdict(row)
+        n = db.query_one("SELECT COUNT(*) AS n FROM routes WHERE model=?", (g["name"],))
+        live = db.query_one(
+            """SELECT COUNT(*) AS n FROM routes r JOIN sites s ON s.id = r.site_id
+               WHERE r.model=? AND r.enabled=1 AND s.enabled=1""", (g["name"],))
+        g["nodes"] = int(n["n"]) if n else 0
+        g["live_nodes"] = int(live["n"]) if live else 0
+        g["is_public"] = int(g["is_public"])
+        g["enabled"] = int(g["enabled"])
+        out.append(g)
+    return out
+
+
+@app.post("/admin/api/groups")
+async def create_group(request: Request, payload: dict = Body(...)):
+    require_admin(request)
+    name = (payload.get("name") or "").strip()
+    if not name:
+        raise HTTPException(400, "统一模型名必填（例如 auto / cheap / coding）")
+    if _group_row(name):
+        raise HTTPException(400, f"统一模型 {name} 已存在")
+    db.execute(
+        """INSERT INTO model_groups(name, display, enabled, is_public, strategy, note, created_at)
+           VALUES (?,?,?,?,?,?,?)""",
+        (name, str(payload.get("display") or ""),
+         1 if payload.get("enabled", True) else 0,
+         1 if payload.get("is_public", True) else 0,
+         (payload.get("strategy") or "").strip(), str(payload.get("note") or ""),
+         time.time()))
+    return {"ok": True, "name": name}
+
+
+@app.put("/admin/api/groups/{name}")
+async def update_group(name: str, request: Request, payload: dict = Body(...)):
+    require_admin(request)
+    if _group_row(name) is None:
+        raise HTTPException(404, "统一模型不存在")
+    fields, values = [], []
+    new_name = (payload.get("name") or "").strip()
+    if new_name and new_name != name:
+        if _group_row(new_name):
+            raise HTTPException(400, f"统一模型 {new_name} 已存在")
+        fields.append("name=?")
+        values.append(new_name)
+    if "display" in payload:
+        fields.append("display=?")
+        values.append(str(payload.get("display") or ""))
+    if "note" in payload:
+        fields.append("note=?")
+        values.append(str(payload.get("note") or ""))
+    if "strategy" in payload:
+        s = (payload.get("strategy") or "").strip()
+        if s and s not in engine.STRATEGIES:
+            raise HTTPException(400, "策略只能是 balanced / priority / round_robin，或留空继承全局")
+        fields.append("strategy=?")
+        values.append(s)
+    if "enabled" in payload:
+        fields.append("enabled=?")
+        values.append(1 if payload["enabled"] else 0)
+    if "is_public" in payload:
+        fields.append("is_public=?")
+        values.append(1 if payload["is_public"] else 0)
+    if not fields:
+        return {"ok": True}
+    values.append(name)
+    db.execute(f"UPDATE model_groups SET {', '.join(fields)} WHERE name=?", values)
+    if new_name and new_name != name:
+        # 改名要带着它的节点一起走，否则节点会变成孤儿
+        db.execute("UPDATE routes SET model=? WHERE model=?", (new_name, name))
+    return {"ok": True, "name": new_name or name}
+
+
+@app.delete("/admin/api/groups/{name}")
+async def delete_group(name: str, request: Request):
+    require_admin(request)
+    n = db.query_one("SELECT COUNT(*) AS n FROM routes WHERE model=?", (name,))
+    has_nodes = bool(n and n["n"])
+    with_nodes = request.query_params.get("nodes") in ("1", "true", "yes")
+    if has_nodes and not with_nodes:
+        raise HTTPException(400, f"该统一模型下还有 {n['n']} 个节点。"
+                                 f"确认要一起删除时请带上 ?nodes=1")
+    if with_nodes:
+        db.execute("DELETE FROM routes WHERE model=?", (name,))
+    db.execute("DELETE FROM model_groups WHERE name=?", (name,))
+    return {"ok": True}
+
+
+@app.get("/admin/api/groups/{name}/nodes")
+async def list_nodes(name: str, request: Request):
+    require_admin(request)
+    now = time.time()
+    out = []
+    for row in db.query(NODE_SQL, (name,)):
+        d = _node_dict(row, now)
+        c = db.query_one(
+            "SELECT count FROM daily_counters WHERE day=? AND site_id=? AND model=?",
+            (engine.today(), d["site_id"], d["model"]))
+        d["today_count"] = int(c["count"]) if c else 0
+        out.append(d)
+    return out
+
+
+@app.post("/admin/api/groups/{name}/nodes")
+async def add_node(name: str, request: Request, payload: dict = Body(...)):
+    require_admin(request)
+    if _group_row(name) is None:
+        raise HTTPException(404, "统一模型不存在，请先创建")
+    try:
+        site_id = int(payload.get("site_id"))
+    except Exception:
+        raise HTTPException(400, "请选择站点")
+    if db.query_one("SELECT 1 FROM sites WHERE id=?", (site_id,)) is None:
+        raise HTTPException(404, "站点不存在")
+    upstream = (payload.get("upstream_model") or "").strip()
+    if not upstream:
+        raise HTTPException(400, "真实模型名必填（该站点上真实存在的模型名）")
+    row = db.query_one("SELECT COALESCE(MAX(priority), 0) AS m FROM routes WHERE model=?",
+                       (name,))
+    nextp = int(row["m"] or 0) + 10
+    try:
+        cur = db.execute(
+            """INSERT INTO routes(site_id, model, upstream_model, enabled, daily_limit, priority)
+               VALUES (?,?,?,1,?,?)""",
+            (site_id, name, upstream, int(payload.get("daily_limit") or 0), nextp))
+    except Exception as e:
+        raise HTTPException(400, f"这个站点已经绑过同一个模型了（站点×模型唯一）：{e}")
+    return {"ok": True, "id": cur.lastrowid}
+
+
+@app.put("/admin/api/groups/nodes/{node_id}")
+async def update_node(node_id: int, request: Request, payload: dict = Body(...)):
+    require_admin(request)
+    if db.query_one("SELECT 1 FROM routes WHERE id=?", (node_id,)) is None:
+        raise HTTPException(404, "节点不存在")
+    fields, values = [], []
+    if "upstream_model" in payload:
+        fields.append("upstream_model=?")
+        values.append(str(payload.get("upstream_model") or "").strip())
+    if "daily_limit" in payload:
+        fields.append("daily_limit=?")
+        values.append(int(payload.get("daily_limit") or 0))
+    if "priority" in payload:
+        fields.append("priority=?")
+        values.append(int(payload.get("priority") or 100))
+    if "enabled" in payload:
+        fields.append("enabled=?")
+        values.append(1 if payload["enabled"] else 0)
+    if not fields:
+        return {"ok": True}
+    values.append(node_id)
+    db.execute(f"UPDATE routes SET {', '.join(fields)} WHERE id=?", values)
+    return {"ok": True}
+
+
+@app.delete("/admin/api/groups/nodes/{node_id}")
+async def delete_node(node_id: int, request: Request):
+    require_admin(request)
+    db.execute("DELETE FROM routes WHERE id=?", (node_id,))
+    return {"ok": True}
+
+
+@app.post("/admin/api/groups/nodes/{node_id}/reset")
+async def reset_node_ep(node_id: int, request: Request):
+    require_admin(request)
+    engine.reset_node(node_id)
+    return {"ok": True}
+
+
+@app.post("/admin/api/groups/{name}/order")
+async def reorder_nodes(name: str, request: Request, payload: dict = Body(...)):
+    """拖拽排序后提交。ids 就是从上到下的节点 id 顺序。
+
+    写进 routes.priority（10/20/30...），priority 策略与 balanced 策略的
+    并列名次都按它排，所以拖完立刻生效。
+    """
+    require_admin(request)
+    ids = payload.get("ids") or []
+    n = 0
+    for i, node_id in enumerate(ids):
+        try:
+            node_id = int(node_id)
+        except (TypeError, ValueError):
+            continue
+        db.execute("UPDATE routes SET priority=? WHERE id=? AND model=?",
+                   (10 + i * 10, node_id, name))
+        n += 1
+    return {"ok": True, "updated": n}
 
 
 # -------- 站点
@@ -837,16 +1208,41 @@ async def delete_route(route_id: int, request: Request):
 
 @app.get("/admin/api/keys")
 async def list_keys(request: Request):
+    """列表只返回打码后的 Key。
+
+    完整 Key 必须通过 /admin/api/keys/{id}/reveal 单独取，
+    避免任何一次「看一眼列表」的请求就把全部密钥明文发到前端。
+    """
     require_admin(request)
     out = []
     for row in db.query("SELECT * FROM api_keys ORDER BY id DESC"):
         d = db.rowdict(row)
+        d["key_masked"] = security.mask_key(d.pop("key", ""))
         c = db.query_one(
             "SELECT count FROM key_counters WHERE day=? AND key_id=?",
             (engine.today(), d["id"]))
         d["today_count"] = int(c["count"]) if c else 0
         out.append(d)
     return out
+
+
+@app.get("/admin/api/keys/{key_id}/reveal")
+async def reveal_key(key_id: int, request: Request):
+    """用户主动点「显示」才返回明文。"""
+    require_admin(request)
+    row = db.query_one("SELECT key, name FROM api_keys WHERE id=?", (key_id,))
+    if row is None:
+        raise HTTPException(404, "密钥不存在")
+    return {"id": key_id, "name": row["name"], "key": row["key"]}
+
+
+@app.get("/admin/api/sites/{site_id}/reveal")
+async def reveal_site_key(site_id: int, request: Request):
+    require_admin(request)
+    row = db.query_one("SELECT api_key, name FROM sites WHERE id=?", (site_id,))
+    if row is None:
+        raise HTTPException(404, "站点不存在")
+    return {"id": site_id, "name": row["name"], "api_key": row["api_key"] or ""}
 
 
 @app.post("/admin/api/keys")
@@ -982,6 +1378,8 @@ async def stats(request: Request, days: int = 7):
 
 SETTING_KEYS = (
     "strategy", "max_attempts", "circuit_threshold", "circuit_cooldown",
+    "node_circuit_threshold", "node_cooldown",
+    "rewrite_model", "switch_before_output",
     "inject_stream_usage", "quota_check_interval",
     "auto_sync_models", "auto_sync_interval",
     "cache_enabled", "cache_endpoints", "cache_only_deterministic",
@@ -1011,9 +1409,30 @@ async def put_settings(request: Request, payload: dict = Body(...)):
 
 # ---------------------------------------------------------------- 页面
 
+@app.get("/admin/api/system")
+async def system_info(request: Request):
+    """数据目录体检 + 开放模式提醒，面板顶部横幅用。"""
+    require_admin(request)
+    info = persistence_report()
+    info["version"] = VERSION
+    has_keys = db.query_one("SELECT 1 FROM api_keys LIMIT 1") is not None
+    info["open_mode"] = not has_keys
+    info["open_mode_warning"] = (
+        "当前是开放模式：还没有创建任何统一 API Key，任何人都能调用 /v1/* 接口。"
+        if not has_keys else ""
+    )
+    return info
+
+
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "version": VERSION, "time": time.time()}
+    return {
+        "ok": True,
+        "version": VERSION,
+        "time": time.time(),
+        "data_dir": _PERSISTENCE_INFO.get("data_dir", ""),
+        "persistent": bool(_PERSISTENCE_INFO.get("is_mount")),
+    }
 
 
 @app.get("/")
