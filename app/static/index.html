@@ -676,13 +676,14 @@ RENDER.keys = async function () {
     const KEYS = await api('/keys');
     const rows = KEYS.map(k => `<tr>
       <td>${esc(k.name)}</td>
-      <td class="mono">${esc(k.key)}</td>
+      <td class="mono" id="kw-${k.id}">${esc(k.key_masked)}</td>
       <td>${k.today_count}</td>
       <td>${k.daily_limit > 0 ? k.daily_limit : '<span class="muted">不限</span>'}</td>
       <td>${k.enabled ? '<span class="tag ok">启用</span>' : '<span class="tag dim">停用</span>'}</td>
       <td class="muted nowrap">${fmtTime(k.last_used_at)}</td>
       <td class="nowrap">
-        <button class="sm" onclick="copyText('${jsq(k.key)}')">复制</button>
+        <button class="sm" onclick="showKey(${k.id})">显示</button>
+        <button class="sm" onclick="copyKey(${k.id})">复制</button>
         <button class="sm" onclick="toggleKey(${k.id},${k.enabled ? 0 : 1})">${k.enabled ? '停用' : '启用'}</button>
         <button class="sm danger" onclick="delKey(${k.id})">删除</button>
       </td></tr>`).join('');
@@ -732,6 +733,23 @@ async function toggleKey(id, enabled) {
   try { await api('/keys/' + id, { method: 'PUT', body: JSON.stringify({ enabled: !!enabled }) }); RENDER.keys(); }
   catch (e) { toast(e.message, 'err'); }
 }
+/* 完整 Key 只在用户主动点「显示 / 复制」时单独取一次；列表本身不带明文 */
+const KEY_CACHE = {};
+async function fetchKey(id) {
+  if (!KEY_CACHE[id]) KEY_CACHE[id] = (await api('/keys/' + id + '/reveal')).key;
+  return KEY_CACHE[id];
+}
+async function showKey(id) {
+  try {
+    const k = await fetchKey(id);
+    const cell = $('#kw-' + id);
+    if (cell) { cell.textContent = k; cell.style.color = 'var(--ink)'; }
+  } catch (e) { toast(e.message, 'err'); }
+}
+async function copyKey(id) {
+  try { copyText(await fetchKey(id)); } catch (e) { toast(e.message, 'err'); }
+}
+
 function copyText(t) {
   navigator.clipboard.writeText(t).then(() => toast('已复制', 'ok'), () => prompt('手动复制：', t));
 }
@@ -1264,6 +1282,163 @@ async function commitOrder(tbody) {
     toast('顺序已保存', 'ok');
     await drawGroupSheet();
   } catch (e) { toast(e.message, 'err'); }
+}
+
+/* ============ 聊天测试（真的走本机网关） ============ */
+
+let CHAT_MSGS = [];
+
+RENDER.chat = async function () {
+  const el = $('#tab-chat');
+  try {
+    const gs = (await api('/groups')).filter(g => g.enabled);
+    const ks = await api('/keys');
+    const gOpts = gs.map(g => `<option value="${esc(g.name)}">${esc(g.name)} · ${g.live_nodes} 个可用节点</option>`).join('');
+    const kOpts = ks.map(k => `<option value="${k.id}">${esc(k.name)} · ${esc(k.key_masked)}</option>`).join('');
+    el.innerHTML = `
+      <div class="card glass">
+        <div class="card-head"><h2>聊天测试</h2></div>
+        <div class="note" style="margin-bottom:14px">
+          这里<b>真的请求本机的 <code>/v1/chat/completions</code></b>，不绕过网关。
+          所以外部客户端会遇到什么，这里就会遇到什么（切换、冷却、断流完全一致）。
+        </div>
+        <div class="row">
+          <div><label>统一模型</label>
+            <select id="ch-model">${gOpts || '<option value="">（还没有统一模型）</option>'}</select></div>
+          <div><label>用哪个网关 Key</label>
+            <select id="ch-key">${kOpts || '<option value="">（还没有 Key）</option>'}</select></div>
+          <div style="max-width:150px"><label>输出方式</label>
+            <select id="ch-stream"><option value="0">一次性返回</option>
+            <option value="1">流式 SSE</option></select></div>
+          <div style="max-width:110px"><label>&nbsp;</label>
+            <button class="primary" id="ch-send" onclick="sendChat()">发送</button></div>
+        </div>
+        <div class="gap"><label>内容</label>
+          <textarea id="ch-input" rows="2" placeholder="随便问一句"></textarea></div>
+      </div>
+      <div class="card glass">
+        <div class="card-head"><h2>对话</h2>
+          <button class="ghost sm" onclick="CHAT_MSGS=[];drawChat()">清空</button></div>
+        <div class="chat-box" id="chat-box"><div class="empty">还没有对话</div></div>
+      </div>`;
+    drawChat();
+  } catch (e) { el.innerHTML = `<div class="card glass empty">加载失败：${esc(e.message)}</div>`; }
+};
+
+function drawChat() {
+  const box = $('#chat-box');
+  if (!box) return;
+  if (!CHAT_MSGS.length) { box.innerHTML = '<div class="empty">还没有对话</div>'; return; }
+  box.innerHTML = CHAT_MSGS.map(m =>
+    m.kind === 'me' ? `<div class="msg me">${esc(m.text)}</div>`
+      : m.kind === 'ai' ? `<div class="msg ai">${esc(m.text) || '<span class="muted">…</span>'}</div>`
+        : `<div class="msg meta">${m.html}</div>`).join('');
+  box.scrollTop = box.scrollHeight;
+}
+
+/* 每条回答下面那行「用了哪个站、哪个真实模型、耗时、切换了几次」 */
+function chatMeta(rows) {
+  const html = rows.filter(r => r[1] !== undefined && r[1] !== null && r[1] !== '')
+    .map(r => `<b>${esc(r[0])}</b> ${esc(String(r[1]))}`).join('　·　');
+  CHAT_MSGS.push({ kind: 'meta', html });
+}
+
+/* 从日志还原这次请求真正走了哪些节点（日志是唯一知道真实站点的地方） */
+async function traceAttempts(t0) {
+  try {
+    const rows = (await api('/logs?limit=15')).filter(r => r.ts >= t0 - 0.5);
+    return rows.reverse();
+  } catch (e) { return []; }
+}
+
+function renderTrace(rows) {
+  if (!rows.length) return;
+  const chain = rows.map(r =>
+    `<span class="tag ${r.ok ? 'ok' : 'err'}">${esc(r.site_name || '缓存')} / ${esc(r.upstream_model || r.model)}${r.ok ? '' : ' ✗'}</span>`).join('');
+  const last = rows[rows.length - 1];
+  const spent = (rows.reduce((a, r) => Math.max(a, r.ts), 0) - rows[0].ts) || 0;
+  CHAT_MSGS.push({ kind: 'meta', html:
+    `尝试链路：<div class="chain">${chain}</div>` +
+    `共尝试 <b>${rows.filter(r => r.ok).length ? rows.lastIndexOf(last) + 1 : rows.length}</b> 个节点` +
+    `${last.error ? '　最近错误：<b>' + esc((last.error || '').slice(0, 120)) + '</b>' : ''}` });
+}
+
+async function sendChat() {
+  const model = $('#ch-model').value;
+  const keyId = parseInt($('#ch-key').value, 10);
+  const text = $('#ch-input').value.trim();
+  const stream = $('#ch-stream').value === '1';
+  if (!model) return toast('请先创建一个统一模型', 'err');
+  if (!keyId) return toast('请先在「密钥」页创建网关 Key', 'err');
+  if (!text) return toast('请输入内容', 'err');
+
+  const btn = $('#ch-send');
+  btn.disabled = true;
+  $('#ch-input').value = '';
+  CHAT_MSGS.push({ kind: 'me', text });
+  const slot = CHAT_MSGS.length;
+  CHAT_MSGS.push({ kind: 'ai', text: '' });
+  drawChat();
+
+  const t0 = Date.now() / 1000;
+  const began = performance.now();
+  try {
+    const key = await fetchKey(keyId);
+    const res = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+      body: JSON.stringify({ model, stream, messages: [{ role: 'user', content: text }] })
+    });
+    if (!stream || !res.ok) {
+      const j = await res.json().catch(() => null);
+      const err = j && j.error ? (j.error.message || JSON.stringify(j.error)) : ('HTTP ' + res.status);
+      CHAT_MSGS[slot].text = (res.ok && j)
+        ? ((j.choices && j.choices[0] && j.choices[0].message.content) || '(空)')
+        : '❌ ' + err;
+    } else {
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const step = await reader.read();
+        if (step.done) break;
+        buf += dec.decode(step.value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop();
+        for (const line of lines) {
+          if (!line.startsWith('data:')) continue;
+          const p = line.slice(5).trim();
+          if (!p || p === '[DONE]') continue;
+          let o; try { o = JSON.parse(p); } catch (e) { continue; }
+          for (const ch of o.choices || []) {
+            const piece = ch.delta && ch.delta.content;
+            if (piece) { CHAT_MSGS[slot].text += piece; drawChat(); }
+          }
+        }
+      }
+      if (!CHAT_MSGS[slot].text) CHAT_MSGS[slot].text = '(没有收到内容)';
+    }
+  } catch (e) {
+    CHAT_MSGS[slot].text = '❌ ' + e.message;
+  }
+  drawChat();
+
+  const ms = Math.round(performance.now() - began);
+  const rows = await traceAttempts(t0);
+  const used = rows.filter(r => r.ok).pop();
+  chatMeta([
+    ['统一模型', model],
+    ['实际站点', used ? used.site_name : (rows.length ? '（全部失败）' : '未知')],
+    ['真实模型', used ? used.upstream_model : ''],
+    ['耗时', ms + ' ms'],
+    ['方式', stream ? '流式' : '一次性'],
+    ['缓存', rows.some(r => r.cached) ? '命中' : ''],
+    ['故障切换', rows.length > 1 ? (rows.length - 1) + ' 次' : '未切换'],
+    ['断流', rows.some(r => r.stream_phase === 'post') ? '输出后断流（锁定节点，未重试）' : '']
+  ]);
+  renderTrace(rows);
+  drawChat();
+  btn.disabled = false;
 }
 
 /* ============ 启动 ============ */
