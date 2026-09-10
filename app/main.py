@@ -10,17 +10,25 @@ from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 
-from . import db, engine, models_sync, quota, security
+from . import cache, chat, db, engine, formats as fm, models_sync, quota, security
 from .config import CONNECT_TIMEOUT, REQUEST_TIMEOUT
 from .db import DEFAULT_SETTINGS
 
 STATIC_DIR = Path(__file__).parent / "static"
+VERSION = "0.4.0"
+
+SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
     security.seed_admin()
+    cache.purge_expired()
     app.state.client = httpx.AsyncClient(
         timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=CONNECT_TIMEOUT),
         limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
@@ -29,6 +37,7 @@ async def lifespan(app: FastAPI):
     tasks = [
         asyncio.create_task(quota.background_loop()),
         asyncio.create_task(models_sync.background_loop(app.state.client)),
+        asyncio.create_task(_cache_janitor()),
     ]
     try:
         yield
@@ -38,19 +47,29 @@ async def lifespan(app: FastAPI):
         await app.state.client.aclose()
 
 
-app = FastAPI(title="RelayHub", version="0.3.0", lifespan=lifespan)
+async def _cache_janitor():
+    while True:
+        await asyncio.sleep(600)
+        try:
+            cache.purge_expired()
+        except Exception:
+            pass
+
+
+app = FastAPI(title="RelayHub", version=VERSION, lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
 
 
-# ---------------------------------------------------------------- 通用工具
+# ---------------------------------------------------------------- 鉴权
 
 def _bearer(request: Request):
     auth = request.headers.get("Authorization", "") or ""
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
-    return ""
+    # Gemini 客户端习惯把 key 放在 query 里
+    return request.query_params.get("key", "") or ""
 
 
 def require_admin(request: Request):
@@ -93,229 +112,343 @@ def incr_key_counter(key_id):
     db.execute("UPDATE api_keys SET last_used_at=? WHERE id=?", (time.time(), key_id))
 
 
-def write_log(*, site=None, model="", upstream_model="", key_info=None, attempt=1, ok=0,
-              status_code=None, latency_ms=0, usage=None, stream=0, error=""):
-    u = usage or {}
-    db.execute(
-        """INSERT INTO request_logs
-           (ts, site_id, site_name, model, upstream_model, key_id, key_name, attempt, ok,
-            status_code, latency_ms, prompt_tokens, completion_tokens, total_tokens, stream, error)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (
-            time.time(),
-            site["site_id"] if site else None,
-            site["name"] if site else "",
-            model,
-            upstream_model,
-            key_info.get("id") if key_info else None,
-            key_info.get("name", "") if key_info else "",
-            attempt, ok, status_code, latency_ms,
-            int(u.get("prompt_tokens") or 0),
-            int(u.get("completion_tokens") or 0),
-            int(u.get("total_tokens") or 0),
-            stream, str(error)[:1000],
-        ),
-    )
+# ================================================================ 统一入口
 
-
-class SSEUsage:
-    """从 SSE 流里拾 usage 字段（用于统计 token）。"""
-
-    def __init__(self):
-        self.buf = b""
-        self.usage = None
-
-    def feed(self, chunk: bytes):
-        if self.usage is not None:
-            return
-        self.buf += chunk
-        while b"\n" in self.buf:
-            line, self.buf = self.buf.split(b"\n", 1)
-            line = line.strip()
-            if not line.startswith(b"data:"):
-                continue
-            data = line[5:].strip()
-            if not data or data == b"[DONE]":
-                continue
-            try:
-                obj = json.loads(data)
-            except Exception:
-                continue
-            if isinstance(obj, dict) and isinstance(obj.get("usage"), dict):
-                self.usage = obj["usage"]
-        if len(self.buf) > 2_000_000:
-            self.buf = self.buf[-10000:]
-
-
-def sse_error(message):
-    payload = {"error": {"message": message, "type": "relayhub_error", "code": "no_upstream"}}
-    return ("data: " + json.dumps(payload, ensure_ascii=False) + "\n\n").encode()
-
-
-# ---------------------------------------------------------------- OpenAI 兼容层
-
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
+async def _read_json(request: Request):
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(400, "请求体不是合法 JSON")
-    if not isinstance(body, dict) or not body.get("model"):
+    if not isinstance(body, dict):
+        raise HTTPException(400, "请求体必须是 JSON 对象")
+    return body
+
+
+def _error_payload(endpoint, message):
+    if endpoint == "anthropic":
+        return fm.sse("error", {"type": "error",
+                                "error": {"type": "api_error", "message": message}})
+    if endpoint == "gemini":
+        return fm.sse_data({"error": {"code": 502, "message": message, "status": "UNAVAILABLE"}})
+    return fm.sse_data({"error": {"message": message, "type": "relayhub_error"}})
+
+
+async def handle(request: Request, endpoint, model_action=None):
+    body = await _read_json(request)
+    key_info = auth_api_key(request)
+
+    # ---- 确定模型与是否流式 ----
+    forced_stream = None
+    if endpoint == "gemini":
+        name, _, action = (model_action or "").partition(":")
+        if name:
+            body["model"] = name
+        forced_stream = action == "streamGenerateContent"
+
+    model = body.get("model")
+    if not model:
         raise HTTPException(400, "缺少 model 字段")
 
-    key_info = auth_api_key(request)
-    model = body["model"]
-    is_stream = bool(body.get("stream"))
+    want_stream = bool(forced_stream) or bool(body.get("stream"))
 
-    strategy = db.get_setting("strategy", "balanced")
-    max_attempts = int(db.get_setting("max_attempts", 3) or 3)
-    inject_usage = bool(db.get_setting("inject_stream_usage", True))
+    # ---- 翻译成统一 OpenAI 请求体 ----
+    if endpoint == "gemini":
+        unified = fm.gemini_to_openai(body, model)
+    else:
+        try:
+            unified = fm.CONVERTERS[endpoint](body)
+        except Exception as e:
+            raise HTTPException(400, f"请求转换失败：{e}")
 
-    cands = engine.get_candidates(model)
-    if not cands:
-        avail = engine.available_models()
-        raise HTTPException(
-            503,
-            f"没有可用上游支持模型 {model}。已配置模型：{', '.join(avail) if avail else '（空）'}",
-        )
-    engine.sort_candidates(cands, strategy)
+    if not unified.get("model"):
+        unified["model"] = model
+    if not unified.get("messages"):
+        raise HTTPException(400, "messages 为空")
+
     incr_key_counter(key_info["id"] if key_info else None)
-
     client = request.app.state.client
+    key = chat.cache_key_for(endpoint, unified)
 
-    # ---------------- 非流式 ----------------
-    if not is_stream:
-        last_err = "未知错误"
-        for attempt, site in enumerate(cands[:max_attempts], start=1):
-            payload = dict(body)
-            if site["upstream_model"]:
-                payload["model"] = site["upstream_model"]
-            engine.incr_today_count(site["site_id"], model)
-            t0 = time.time()
-            try:
-                r = await client.post(
-                    engine.norm_base(site["base_url"]) + "/chat/completions",
-                    json=payload,
-                    headers=engine.upstream_headers(site),
+    # ---- 缓存命中 ----
+    if key:
+        hit = chat.lookup(key)
+        if hit:
+            unified_resp = hit["response_json"]
+            chat.write_log(model=model, usage=chat._usage_of(unified_resp), ok=1, cached=1,
+                           endpoint=endpoint, latency_ms=0, key_info=key_info,
+                           stream=1 if want_stream else 0)
+            if want_stream:
+                return StreamingResponse(
+                    _render_cached_stream(endpoint, unified_resp, model),
+                    media_type="text/event-stream", headers=SSE_HEADERS,
                 )
-            except Exception as e:
-                engine.record_failure(site["site_id"], e)
-                write_log(site=site, model=model, upstream_model=payload["model"],
-                          key_info=key_info, attempt=attempt, ok=0,
-                          latency_ms=int((time.time() - t0) * 1000), error=f"连接失败: {e}")
-                last_err = f"{site['name']}: {e}"
-                continue
+            return JSONResponse(fm.RENDERERS[endpoint](unified_resp, model))
 
-            latency = int((time.time() - t0) * 1000)
-            if r.status_code == 200:
-                try:
-                    data = r.json()
-                except Exception as e:
-                    engine.record_failure(site["site_id"], f"返回非 JSON: {e}")
-                    write_log(site=site, model=model, upstream_model=payload["model"],
-                              key_info=key_info, attempt=attempt, ok=0, status_code=200,
-                              latency_ms=latency, error="返回非 JSON")
-                    last_err = f"{site['name']}: 返回非 JSON"
-                    continue
-                engine.record_success(site["site_id"])
-                write_log(site=site, model=model, upstream_model=payload["model"],
-                          key_info=key_info, attempt=attempt, ok=1, status_code=200,
-                          latency_ms=latency, usage=data.get("usage"))
-                return JSONResponse(data)
+    # ---- 非流式 ----
+    if not want_stream:
+        try:
+            unified_resp, _ = await chat.complete(client, unified, key_info, endpoint)
+        except chat.NoUpstream as e:
+            avail = "、".join(e.available) if e.available else "（空）"
+            raise HTTPException(503, f"没有可用上游支持模型 {model}。已配置模型：{avail}")
+        except chat.UpstreamFailed as e:
+            raise HTTPException(502, str(e))
+        return JSONResponse(fm.RENDERERS[endpoint](unified_resp, model))
 
-            err_text = (r.text or "")[:500]
-            engine.record_failure(site["site_id"], f"{r.status_code} {err_text}")
-            write_log(site=site, model=model, upstream_model=payload["model"],
-                      key_info=key_info, attempt=attempt, ok=0, status_code=r.status_code,
-                      latency_ms=latency, error=err_text)
-            last_err = f"{site['name']}: HTTP {r.status_code} {err_text}"
-
-        raise HTTPException(502, f"所有上游均失败。最后错误：{last_err}")
-
-    # ---------------- 流式 ----------------
-    async def gen():
-        attempts = 0
-        last_err = "未知错误"
-        for site in cands:
-            if attempts >= max_attempts:
-                break
-            attempts += 1
-
-            payload = dict(body)
-            if site["upstream_model"]:
-                payload["model"] = site["upstream_model"]
-            if inject_usage:
-                so = payload.get("stream_options")
-                if not isinstance(so, dict):
-                    so = {}
-                so["include_usage"] = True
-                payload["stream_options"] = so
-
-            engine.incr_today_count(site["site_id"], model)
-            t0 = time.time()
-            try:
-                req = client.build_request(
-                    "POST",
-                    engine.norm_base(site["base_url"]) + "/chat/completions",
-                    json=payload,
-                    headers=engine.upstream_headers(site),
-                )
-                resp = await client.send(req, stream=True)
-            except Exception as e:
-                engine.record_failure(site["site_id"], e)
-                write_log(site=site, model=model, upstream_model=payload["model"],
-                          key_info=key_info, attempt=attempts, ok=0, stream=1,
-                          latency_ms=int((time.time() - t0) * 1000), error=f"连接失败: {e}")
-                last_err = f"{site['name']}: {e}"
-                continue
-
-            if resp.status_code != 200:
-                try:
-                    txt = (await resp.aread()).decode("utf-8", "ignore")[:500]
-                except Exception:
-                    txt = ""
-                await resp.aclose()
-                engine.record_failure(site["site_id"], f"{resp.status_code} {txt}")
-                write_log(site=site, model=model, upstream_model=payload["model"],
-                          key_info=key_info, attempt=attempts, ok=0, stream=1,
-                          status_code=resp.status_code,
-                          latency_ms=int((time.time() - t0) * 1000), error=txt)
-                last_err = f"{site['name']}: HTTP {resp.status_code} {txt}"
-                continue
-
-            # 拿到 200，开始往外吐字节 —— 从此不能再切换上游
-            engine.record_success(site["site_id"])
-            tracker = SSEUsage()
-            failed = False
-            try:
-                async for chunk in resp.aiter_bytes():
-                    tracker.feed(chunk)
-                    yield chunk
-            except Exception as e:
-                failed = True
-                last_err = f"{site['name']} 传输中断: {e}"
-                write_log(site=site, model=model, upstream_model=payload["model"],
-                          key_info=key_info, attempt=attempts, ok=0, stream=1,
-                          status_code=200, latency_ms=int((time.time() - t0) * 1000),
-                          error=f"传输中断: {e}")
-            finally:
-                await resp.aclose()
-
-            if not failed:
-                write_log(site=site, model=model, upstream_model=payload["model"],
-                          key_info=key_info, attempt=attempts, ok=1, stream=1,
-                          status_code=200, latency_ms=int((time.time() - t0) * 1000),
-                          usage=tracker.usage)
-            return
-
-        yield sse_error(f"所有上游均失败。最后错误：{last_err}")
-
+    # ---- 流式 ----
     return StreamingResponse(
-        gen(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
-                 "X-Accel-Buffering": "no"},
+        _render_stream(endpoint, client, unified, key_info, model, key),
+        media_type="text/event-stream", headers=SSE_HEADERS,
     )
+
+
+async def _render_stream(endpoint, client, unified, key_info, model, key):
+    holder = {}
+    finish_reason = "stop"
+
+    if endpoint == "openai":
+        try:
+            async for ev in chat.stream(client, unified, key_info, endpoint, holder):
+                yield ev.raw
+        except chat.UpstreamFailed as e:
+            yield _error_payload(endpoint, str(e))
+        except chat.NoUpstream as e:
+            yield _error_payload(endpoint, str(e))
+        else:
+            chat.store(key, unified, holder.get("final"), stream=True)
+        return
+
+    parser = chat.SSEParser()
+
+    if endpoint == "anthropic":
+        yield fm.sse("message_start", {"type": "message_start", "message": {
+            "id": "msg_relayhub", "type": "message", "role": "assistant",
+            "model": model, "content": [], "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0}}})
+        yield fm.sse("content_block_start", {"type": "content_block_start", "index": 0,
+                                             "content_block": {"type": "text", "text": ""}})
+        try:
+            async for ev in chat.stream(client, unified, key_info, endpoint, holder):
+                for obj in parser.feed(ev.raw):
+                    for ch in obj.get("choices") or []:
+                        d = ch.get("delta") or {}
+                        if ch.get("finish_reason"):
+                            finish_reason = ch["finish_reason"]
+                        text = d.get("content")
+                        if isinstance(text, str) and text:
+                            yield fm.sse("content_block_delta", {
+                                "type": "content_block_delta", "index": 0,
+                                "delta": {"type": "text_delta", "text": text}})
+        except (chat.UpstreamFailed, chat.NoUpstream) as e:
+            yield fm.sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+            yield _error_payload(endpoint, str(e))
+            return
+        finally:
+            pass
+        yield fm.sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+        final = holder.get("final") or {}
+        usage = final.get("usage") or {}
+        stop = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}.get(
+            finish_reason, "end_turn")
+        yield fm.sse("message_delta", {"type": "message_delta",
+                                       "delta": {"stop_reason": stop, "stop_sequence": None},
+                                       "usage": {"output_tokens": int(usage.get("completion_tokens") or 0)}})
+        yield fm.sse("message_stop", {"type": "message_stop"})
+        chat.store(key, unified, holder.get("final"), stream=True)
+        return
+
+    if endpoint == "gemini":
+        try:
+            async for ev in chat.stream(client, unified, key_info, endpoint, holder):
+                for obj in parser.feed(ev.raw):
+                    for ch in obj.get("choices") or []:
+                        d = ch.get("delta") or {}
+                        text = d.get("content")
+                        if isinstance(text, str) and text:
+                            yield fm.sse_data({"candidates": [{
+                                "content": {"parts": [{"text": text}], "role": "model"},
+                                "index": 0}]})
+        except (chat.UpstreamFailed, chat.NoUpstream) as e:
+            yield _error_payload(endpoint, str(e))
+            return
+        final = holder.get("final")
+        if isinstance(final, dict):
+            yield fm.sse_data(fm.openai_to_gemini(final, model))
+            chat.store(key, unified, final, stream=True)
+        return
+
+    # ---- Responses API ----
+    rid = "resp_relayhub"
+    yield fm.sse("response.created", {"type": "response.created", "response": {
+        "id": rid, "object": "response", "created_at": int(time.time()),
+        "status": "in_progress", "model": model, "output": []}})
+    yield fm.sse("response.in_progress", {"type": "response.in_progress", "response": {
+        "id": rid, "object": "response", "created_at": int(time.time()),
+        "status": "in_progress", "model": model, "output": []}})
+    started = False
+    try:
+        async for ev in chat.stream(client, unified, key_info, endpoint, holder):
+            for obj in parser.feed(ev.raw):
+                for ch in obj.get("choices") or []:
+                    d = ch.get("delta") or {}
+                    text = d.get("content")
+                    if not isinstance(text, str) or not text:
+                        continue
+                    if not started:
+                        started = True
+                        yield fm.sse("response.output_item.added", {
+                            "type": "response.output_item.added", "output_index": 0,
+                            "item": {"id": "msg_relayhub", "type": "message",
+                                     "status": "in_progress", "role": "assistant", "content": []}})
+                        yield fm.sse("response.content_part.added", {
+                            "type": "response.content_part.added", "item_id": "msg_relayhub",
+                            "output_index": 0, "content_index": 0,
+                            "part": {"type": "output_text", "text": "", "annotations": []}})
+                    yield fm.sse("response.output_text.delta", {
+                        "type": "response.output_text.delta", "item_id": "msg_relayhub",
+                        "output_index": 0, "content_index": 0, "delta": text})
+    except (chat.UpstreamFailed, chat.NoUpstream) as e:
+        yield fm.sse("response.failed", {"type": "response.failed", "response": {
+            "id": rid, "object": "response", "status": "failed", "model": model,
+            "output": [], "error": {"code": "upstream_error", "message": str(e)}}})
+        return
+
+    final = holder.get("final") or {}
+    usage = final.get("usage") or {}
+    text_part = ""
+    if isinstance(final.get("choices"), list) and final["choices"]:
+        text_part = (final["choices"][0].get("message") or {}).get("content") or ""
+    if started:
+        yield fm.sse("response.output_text.done", {
+            "type": "response.output_text.done", "item_id": "msg_relayhub",
+            "output_index": 0, "content_index": 0, "text": text_part})
+        yield fm.sse("response.content_part.done", {
+            "type": "response.content_part.done", "item_id": "msg_relayhub",
+            "output_index": 0, "content_index": 0,
+            "part": {"type": "output_text", "text": text_part, "annotations": []}})
+        yield fm.sse("response.output_item.done", {
+            "type": "response.output_item.done", "output_index": 0,
+            "item": {"id": "msg_relayhub", "type": "message", "status": "completed",
+                     "role": "assistant",
+                     "content": [{"type": "output_text", "text": text_part,
+                                  "annotations": []}]}})
+
+    complete = fm.openai_to_responses(final, model)
+    complete["id"] = rid
+    complete["usage"] = {
+        "input_tokens": int(usage.get("prompt_tokens") or 0),
+        "output_tokens": int(usage.get("completion_tokens") or 0),
+        "total_tokens": int(usage.get("total_tokens") or 0),
+    }
+    yield fm.sse("response.completed", {"type": "response.completed", "response": complete})
+    chat.store(key, unified, final, stream=True)
+
+
+async def _render_cached_stream(endpoint, unified_resp, model):
+    """缓存命中时的流式回放（从完整响应合成）。"""
+    if endpoint == "openai":
+        text, tool_calls = fm.chunk_text(unified_resp)
+        base = {
+            "id": unified_resp.get("id") or "chatcmpl-relayhub",
+            "object": "chat.completion.chunk",
+            "created": unified_resp.get("created") or int(time.time()),
+            "model": unified_resp.get("model") or model,
+        }
+        yield fm.sse_data({**base, "choices": [{"index": 0,
+                                                 "delta": {"role": "assistant", "content": ""},
+                                                 "finish_reason": None}]})
+        for piece in fm.split_pieces(text):
+            yield fm.sse_data({**base, "choices": [{"index": 0,
+                                                     "delta": {"content": piece},
+                                                     "finish_reason": None}]})
+        for i, tc in enumerate(tool_calls or []):
+            fn = tc.get("function") or {}
+            yield fm.sse_data({**base, "choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": i, "id": tc.get("id"), "type": "function",
+                "function": {"name": fn.get("name"), "arguments": fn.get("arguments")}}]},
+                "finish_reason": None}]})
+        choice = fm._first_choice(unified_resp)
+        yield fm.sse_data({**base, "choices": [{"index": 0, "delta": {}, "finish_reason":
+                                                 choice.get("finish_reason") or "stop"}]})
+        if unified_resp.get("usage"):
+            yield fm.sse_data({**base, "choices": [], "usage": unified_resp["usage"]})
+        yield b"data: [DONE]\n\n"
+        return
+
+    if endpoint == "anthropic":
+        res = fm.openai_to_anthropic(unified_resp, model)
+        yield fm.sse("message_start", {"type": "message_start", "message": {
+            **res, "content": [], "stop_reason": None}})
+        yield fm.sse("content_block_start", {"type": "content_block_start", "index": 0,
+                                             "content_block": {"type": "text", "text": ""}})
+        text = "".join(b.get("text", "") for b in res["content"] if b.get("type") == "text")
+        for piece in fm.split_pieces(text):
+            yield fm.sse("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                                 "delta": {"type": "text_delta", "text": piece}})
+        yield fm.sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+        yield fm.sse("message_delta", {"type": "message_delta",
+                                       "delta": {"stop_reason": res["stop_reason"],
+                                                 "stop_sequence": None},
+                                       "usage": {"output_tokens": res["usage"]["output_tokens"]}})
+        yield fm.sse("message_stop", {"type": "message_stop"})
+        return
+
+    if endpoint == "gemini":
+        text, _ = fm.chunk_text(unified_resp)
+        for piece in fm.split_pieces(text):
+            yield fm.sse_data({"candidates": [{
+                "content": {"parts": [{"text": piece}], "role": "model"}, "index": 0}]})
+        yield fm.sse_data(fm.openai_to_gemini(unified_resp, model))
+        return
+
+    # Responses
+    rid = "resp_relayhub"
+    full = fm.openai_to_responses(unified_resp, model)
+    full["id"] = rid
+    yield fm.sse("response.created", {"type": "response.created", "response": full})
+    yield fm.sse("response.output_item.added", {
+        "type": "response.output_item.added", "output_index": 0,
+        "item": {"id": "msg_relayhub", "type": "message", "status": "in_progress",
+                 "role": "assistant", "content": []}})
+    yield fm.sse("response.content_part.added", {
+        "type": "response.content_part.added", "item_id": "msg_relayhub",
+        "output_index": 0, "content_index": 0,
+        "part": {"type": "output_text", "text": "", "annotations": []}})
+    for piece in fm.split_pieces(full.get("output_text") or ""):
+        yield fm.sse("response.output_text.delta", {
+            "type": "response.output_text.delta", "item_id": "msg_relayhub",
+            "output_index": 0, "content_index": 0, "delta": piece})
+    yield fm.sse("response.output_text.done", {
+        "type": "response.output_text.done", "item_id": "msg_relayhub",
+        "output_index": 0, "content_index": 0, "text": full.get("output_text") or ""})
+    yield fm.sse("response.completed", {"type": "response.completed", "response": full})
+
+
+# ================================================================ 四个入口
+
+@app.post("/v1/chat/completions")
+async def ep_openai(request: Request):
+    return await handle(request, "openai")
+
+
+@app.post("/v1/responses")
+async def ep_responses(request: Request):
+    return await handle(request, "responses")
+
+
+@app.post("/v1/messages")
+async def ep_anthropic(request: Request):
+    return await handle(request, "anthropic")
+
+
+@app.post("/v1beta/models/{model_action}")
+async def ep_gemini_v1beta(model_action: str, request: Request):
+    return await handle(request, "gemini", model_action)
+
+
+@app.post("/v1/models/{model_action}")
+async def ep_gemini_v1(model_action: str, request: Request):
+    return await handle(request, "gemini", model_action)
 
 
 @app.get("/v1/models")
@@ -371,10 +504,7 @@ async def put_account(request: Request, payload: dict = Body(...)):
 
     if new_pw:
         if security.password_from_env():
-            raise HTTPException(
-                400,
-                "面板密码由环境变量 ADMIN_PASSWORD 管理，请修改该环境变量后重启服务",
-            )
+            raise HTTPException(400, "面板密码由环境变量 ADMIN_PASSWORD 管理，请修改该环境变量后重启服务")
         if len(new_pw) < 6:
             raise HTTPException(400, "新密码至少 6 位")
         if not security.verify_password(old_pw, row["password_hash"]):
@@ -384,15 +514,34 @@ async def put_account(request: Request, payload: dict = Body(...)):
 
     if new_username and new_username != row["username"]:
         if security.username_from_env():
-            raise HTTPException(
-                400, "面板账号由环境变量 ADMIN_USERNAME 管理，请修改该环境变量后重启服务"
-            )
+            raise HTTPException(400, "面板账号由环境变量 ADMIN_USERNAME 管理，请修改该环境变量后重启服务")
         try:
             db.execute("UPDATE admins SET username=? WHERE id=?", (new_username, row["id"]))
         except Exception as e:
             raise HTTPException(400, f"修改失败：{e}")
 
     return {"ok": True}
+
+
+# -------- 缓存管理
+
+@app.get("/admin/api/cache")
+async def cache_stats(request: Request):
+    require_admin(request)
+    return cache.stats()
+
+
+@app.post("/admin/api/cache/clear")
+async def cache_clear(request: Request):
+    require_admin(request)
+    cache.clear()
+    return {"ok": True}
+
+
+@app.post("/admin/api/cache/purge")
+async def cache_purge(request: Request):
+    require_admin(request)
+    return {"ok": True, "removed": cache.purge_expired()}
 
 
 # -------- 配置备份
@@ -404,23 +553,13 @@ async def export_config(request: Request):
     for row in db.query("SELECT * FROM sites ORDER BY id"):
         d = db.rowdict(row)
         sites.append({
-            "name": d["name"],
-            "base_url": d["base_url"],
-            "api_key": d["api_key"],
-            "enabled": d["enabled"],
-            "priority": d["priority"],
-            "note": d["note"],
+            "name": d["name"], "base_url": d["base_url"], "api_key": d["api_key"],
+            "enabled": d["enabled"], "priority": d["priority"], "note": d["note"],
         })
-    routes = [
-        db.rowdict(r) for r in db.query(
-            "SELECT site_id, model, upstream_model, enabled, daily_limit FROM routes"
-        )
-    ]
-    keys = [
-        db.rowdict(r) for r in db.query(
-            "SELECT key, name, enabled, daily_limit, note FROM api_keys"
-        )
-    ]
+    routes = [db.rowdict(r) for r in db.query(
+        "SELECT site_id, model, upstream_model, enabled, daily_limit FROM routes")]
+    keys = [db.rowdict(r) for r in db.query(
+        "SELECT key, name, enabled, daily_limit, note FROM api_keys")]
     return {
         "version": 1,
         "app": "relayhub",
@@ -449,18 +588,14 @@ async def import_config(request: Request, payload: dict = Body(...)):
         note = s.get("note") or ""
         row = db.query_one("SELECT id FROM sites WHERE name=?", (name,))
         if row:
-            db.execute(
-                """UPDATE sites SET base_url=?, api_key=?, enabled=?, priority=?, note=?
-                   WHERE id=?""",
-                (base_url, api_key, enabled, priority, note, row["id"]),
-            )
+            db.execute("UPDATE sites SET base_url=?, api_key=?, enabled=?, priority=?, note=? WHERE id=?",
+                       (base_url, api_key, enabled, priority, note, row["id"]))
             name_to_id[name] = row["id"]
         else:
             cur = db.execute(
                 """INSERT INTO sites(name, base_url, api_key, enabled, priority, note, created_at)
                    VALUES (?,?,?,?,?,?,?)""",
-                (name, base_url, api_key, enabled, priority, note, time.time()),
-            )
+                (name, base_url, api_key, enabled, priority, note, time.time()))
             name_to_id[name] = cur.lastrowid
 
     site_by_id = {}
@@ -475,46 +610,34 @@ async def import_config(request: Request, payload: dict = Body(...)):
         site_name = r.get("site_name") or site_by_id.get(r.get("site_id"))
         if not site_name or site_name not in name_to_id:
             continue
-        site_id = name_to_id[site_name]
-        upstream_model = (r.get("upstream_model") or "").strip()
-        daily_limit = int(r.get("daily_limit") or 0)
-        enabled = 1 if r.get("enabled", True) else 0
         db.execute(
             """INSERT INTO routes(site_id, model, upstream_model, enabled, daily_limit)
                VALUES (?,?,?,?,?)
                ON CONFLICT(site_id, model) DO UPDATE SET
                  upstream_model=excluded.upstream_model,
-                 daily_limit=excluded.daily_limit,
-                 enabled=excluded.enabled""",
-            (site_id, model, upstream_model, enabled, daily_limit),
-        )
+                 daily_limit=excluded.daily_limit, enabled=excluded.enabled""",
+            (name_to_id[site_name], model, (r.get("upstream_model") or "").strip(),
+             1 if r.get("enabled", True) else 0, int(r.get("daily_limit") or 0)))
         added_routes += 1
 
     added_keys = 0
     for k in data.get("keys") or []:
         key = (k.get("key") or "").strip()
-        if not key:
-            continue
-        if db.query_one("SELECT 1 FROM api_keys WHERE key=?", (key,)):
+        if not key or db.query_one("SELECT 1 FROM api_keys WHERE key=?", (key,)):
             continue
         db.execute(
             """INSERT INTO api_keys(key, name, enabled, daily_limit, note, created_at)
                VALUES (?,?,?,?,?,?)""",
             (key, k.get("name") or "未命名", 1 if k.get("enabled", True) else 0,
-             int(k.get("daily_limit") or 0), k.get("note") or "", time.time()),
-        )
+             int(k.get("daily_limit") or 0), k.get("note") or "", time.time()))
         added_keys += 1
 
     for k, v in (data.get("settings") or {}).items():
         if k in DEFAULT_SETTINGS:
             db.set_setting(k, v)
 
-    return {
-        "ok": True,
-        "sites": len(data.get("sites") or []),
-        "routes": added_routes,
-        "keys": added_keys,
-    }
+    return {"ok": True, "sites": len(data.get("sites") or []),
+            "routes": added_routes, "keys": added_keys}
 
 
 # -------- 站点
@@ -529,8 +652,7 @@ async def list_sites(request: Request):
         d["api_key_masked"] = security.mask_key(d.pop("api_key", ""))
         c = db.query_one(
             "SELECT COALESCE(SUM(count),0) AS c FROM daily_counters WHERE day=? AND site_id=?",
-            (engine.today(), d["id"]),
-        )
+            (engine.today(), d["id"]))
         d["today_total"] = int(c["c"]) if c else 0
         d["circuit_active"] = bool(d["circuit_until"] and d["circuit_until"] > now)
         out.append(d)
@@ -550,9 +672,7 @@ async def create_site(request: Request, payload: dict = Body(...)):
                VALUES (?,?,?,?,?,?,?)""",
             (name, base_url, (payload.get("api_key") or "").strip(),
              1 if payload.get("enabled", True) else 0,
-             int(payload.get("priority") or 100),
-             payload.get("note") or "", time.time()),
-        )
+             int(payload.get("priority") or 100), payload.get("note") or "", time.time()))
     except Exception as e:
         raise HTTPException(400, f"创建失败（名称可能重复）：{e}")
     return {"id": cur.lastrowid}
@@ -619,10 +739,8 @@ async def site_quota(site_id: int, request: Request):
     if row is None:
         raise HTTPException(404, "站点不存在")
     site = db.rowdict(row)
-    info = await quota.check_site(
-        request.app.state.client, site_id, site["base_url"], site["api_key"]
-    )
-    return info
+    return await quota.check_site(
+        request.app.state.client, site_id, site["base_url"], site["api_key"])
 
 
 # -------- 模型发现与同步
@@ -642,7 +760,7 @@ async def import_models(request: Request, payload: dict = Body(...)):
     return {"ok": True, "added": added, "total": len(items)}
 
 
-# -------- 路由（站点 × 模型）
+# -------- 路由
 
 @app.get("/admin/api/routes")
 async def list_routes(request: Request):
@@ -650,15 +768,13 @@ async def list_routes(request: Request):
     rows = db.query(
         """SELECT r.*, s.name AS site_name, s.enabled AS site_enabled, s.priority AS site_priority
            FROM routes r JOIN sites s ON s.id = r.site_id
-           ORDER BY r.model, s.priority, s.id"""
-    )
+           ORDER BY r.model, s.priority, s.id""")
     out = []
     for row in rows:
         d = db.rowdict(row)
         c = db.query_one(
             "SELECT count FROM daily_counters WHERE day=? AND site_id=? AND model=?",
-            (engine.today(), d["site_id"], d["model"]),
-        )
+            (engine.today(), d["site_id"], d["model"]))
         d["today_count"] = int(c["count"]) if c else 0
         out.append(d)
     return out
@@ -674,16 +790,15 @@ async def create_route(request: Request, payload: dict = Body(...)):
     model = (payload.get("model") or "").strip()
     if not model:
         raise HTTPException(400, "模型名必填")
-    upstream_model = (payload.get("upstream_model") or "").strip()
-    daily_limit = int(payload.get("daily_limit") or 0)
     try:
         cur = db.execute(
             """INSERT INTO routes(site_id, model, upstream_model, enabled, daily_limit)
                VALUES (?,?,?,1,?)
                ON CONFLICT(site_id, model) DO UPDATE
-               SET upstream_model=excluded.upstream_model, daily_limit=excluded.daily_limit, enabled=1""",
-            (site_id, model, upstream_model, daily_limit),
-        )
+               SET upstream_model=excluded.upstream_model,
+                   daily_limit=excluded.daily_limit, enabled=1""",
+            (site_id, model, (payload.get("upstream_model") or "").strip(),
+             int(payload.get("daily_limit") or 0)))
     except Exception as e:
         raise HTTPException(400, str(e))
     return {"id": cur.lastrowid}
@@ -721,13 +836,12 @@ async def delete_route(route_id: int, request: Request):
 @app.get("/admin/api/keys")
 async def list_keys(request: Request):
     require_admin(request)
-    rows = db.query("SELECT * FROM api_keys ORDER BY id DESC")
     out = []
-    for row in rows:
+    for row in db.query("SELECT * FROM api_keys ORDER BY id DESC"):
         d = db.rowdict(row)
         c = db.query_one(
-            "SELECT count FROM key_counters WHERE day=? AND key_id=?", (engine.today(), d["id"])
-        )
+            "SELECT count FROM key_counters WHERE day=? AND key_id=?",
+            (engine.today(), d["id"]))
         d["today_count"] = int(c["count"]) if c else 0
         out.append(d)
     return out
@@ -741,8 +855,8 @@ async def create_key(request: Request, payload: dict = Body(...)):
     db.execute(
         """INSERT INTO api_keys(key, name, enabled, daily_limit, note, created_at)
            VALUES (?,?,1,?,?,?)""",
-        (key, name, int(payload.get("daily_limit") or 0), payload.get("note") or "", time.time()),
-    )
+        (key, name, int(payload.get("daily_limit") or 0),
+         payload.get("note") or "", time.time()))
     return {"key": key, "name": name}
 
 
@@ -782,12 +896,10 @@ async def list_logs(request: Request, site_id: int = 0, limit: int = 100, offset
     if site_id:
         rows = db.query(
             "SELECT * FROM request_logs WHERE site_id=? ORDER BY id DESC LIMIT ? OFFSET ?",
-            (site_id, limit, offset),
-        )
+            (site_id, limit, offset))
     else:
         rows = db.query(
-            "SELECT * FROM request_logs ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)
-        )
+            "SELECT * FROM request_logs ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset))
     return [db.rowdict(r) for r in rows]
 
 
@@ -805,19 +917,17 @@ async def stats(request: Request, days: int = 7):
     since = time.time() - days * 86400
 
     totals = db.query_one(
-        """SELECT COUNT(*) AS req, COALESCE(SUM(ok),0) AS ok, COALESCE(SUM(total_tokens),0) AS tok
-           FROM request_logs WHERE ts >= ?""",
-        (since,),
-    )
+        """SELECT COUNT(*) AS req, COALESCE(SUM(ok),0) AS ok,
+                  COALESCE(SUM(total_tokens),0) AS tok, COALESCE(SUM(cached),0) AS ch
+           FROM request_logs WHERE ts >= ?""", (since,))
     today_row = db.query_one(
-        "SELECT COUNT(*) AS c FROM request_logs WHERE ts >= ?", (time.time() - 86400,)
-    )
+        "SELECT COUNT(*) AS c, COALESCE(SUM(cached),0) AS ch FROM request_logs WHERE ts >= ?",
+        (time.time() - 86400,))
     daily_rows = db.query(
         """SELECT strftime('%Y-%m-%d', ts, 'unixepoch', 'localtime') AS d,
-                  COUNT(*) AS req, COALESCE(SUM(ok),0) AS ok, COALESCE(SUM(total_tokens),0) AS tok
-           FROM request_logs WHERE ts >= ? GROUP BY d""",
-        (since,),
-    )
+                  COUNT(*) AS req, COALESCE(SUM(ok),0) AS ok,
+                  COALESCE(SUM(total_tokens),0) AS tok, COALESCE(SUM(cached),0) AS ch
+           FROM request_logs WHERE ts >= ? GROUP BY d""", (since,))
     daily_map = {r["d"]: r for r in daily_rows}
 
     today = datetime.date.today()
@@ -830,6 +940,7 @@ async def stats(request: Request, days: int = 7):
             "requests": int(r["req"]) if r else 0,
             "ok": int(r["ok"]) if r else 0,
             "tokens": int(r["tok"]) if r else 0,
+            "cached": int(r["ch"]) if r else 0,
         })
 
     sites = []
@@ -837,13 +948,10 @@ async def stats(request: Request, days: int = 7):
         d = db.rowdict(row)
         c = db.query_one(
             "SELECT COALESCE(SUM(count),0) AS c FROM daily_counters WHERE day=? AND site_id=?",
-            (engine.today(), d["id"]),
-        )
+            (engine.today(), d["id"]))
         req = db.query_one(
-            """SELECT COUNT(*) AS n, COALESCE(SUM(ok),0) AS ok
-               FROM request_logs WHERE site_id=? AND ts >= ?""",
-            (d["id"], since),
-        )
+            "SELECT COUNT(*) AS n, COALESCE(SUM(ok),0) AS ok FROM request_logs
+             WHERE site_id=? AND ts >= ?", (d["id"], since))
         d["today_total"] = int(c["c"]) if c else 0
         d["period_requests"] = int(req["n"]) if req else 0
         d["period_ok"] = int(req["ok"]) if req else 0
@@ -856,12 +964,15 @@ async def stats(request: Request, days: int = 7):
             "requests": int(totals["req"]) if totals else 0,
             "ok": int(totals["ok"]) if totals else 0,
             "tokens": int(totals["tok"]) if totals else 0,
+            "cached": int(totals["ch"]) if totals else 0,
             "today_requests": int(today_row["c"]) if today_row else 0,
+            "today_cached": int(today_row["ch"]) if today_row else 0,
             "sites": len(sites),
             "models": len(engine.available_models()),
         },
         "daily": daily,
         "sites": sites,
+        "cache": cache.stats(),
     }
 
 
@@ -871,6 +982,8 @@ SETTING_KEYS = (
     "strategy", "max_attempts", "circuit_threshold", "circuit_cooldown",
     "inject_stream_usage", "quota_check_interval",
     "auto_sync_models", "auto_sync_interval",
+    "cache_enabled", "cache_endpoints", "cache_only_deterministic",
+    "cache_ttl", "cache_max_entries",
 )
 
 
@@ -884,8 +997,13 @@ async def get_settings(request: Request):
 async def put_settings(request: Request, payload: dict = Body(...)):
     require_admin(request)
     for k, v in payload.items():
-        if k in SETTING_KEYS:
-            db.set_setting(k, v)
+        if k not in SETTING_KEYS:
+            continue
+        if k == "cache_endpoints":
+            if not isinstance(v, list):
+                v = [v]
+            v = [x for x in v if x in fm.ENDPOINTS]
+        db.set_setting(k, v)
     return await get_settings(request)
 
 
@@ -893,7 +1011,7 @@ async def put_settings(request: Request, payload: dict = Body(...)):
 
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "time": time.time()}
+    return {"ok": True, "version": VERSION, "time": time.time()}
 
 
 @app.get("/")
