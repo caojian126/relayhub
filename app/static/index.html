@@ -124,6 +124,7 @@ tbody tr:last-child td{border-bottom:none}
 .tag.warn{color:var(--warn);background:rgba(217,150,43,.13);border-color:rgba(217,150,43,.24)}
 .tag.dim{color:var(--ink-3);background:rgba(139,144,168,.12);border-color:rgba(139,144,168,.2)}
 .tag.acc{color:#8a5bd0;background:rgba(160,110,240,.13);border-color:rgba(160,110,240,.22)}
+.tag.cache{color:#0d8a7a;background:rgba(20,180,160,.14);border-color:rgba(20,180,160,.25)}
 .bars{display:flex;align-items:flex-end;gap:10px;height:132px;padding-top:10px}
 .bar-wrap{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;height:100%;gap:7px}
 .bar{width:100%;max-width:56px;border-radius:8px 8px 4px 4px;min-height:3px;background:var(--grad);opacity:.85;transition:opacity .2s}
@@ -167,6 +168,10 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:12px;padding:2px 7px;bor
 .note b{color:var(--ink)}
 .banner{padding:14px 18px;border-radius:18px;font-size:13px;margin-bottom:18px;
   background:rgba(255,235,205,.6);border:1px solid rgba(217,150,43,.3);color:#8a6114}
+.ep{display:flex;gap:10px;align-items:center;padding:9px 0;border-bottom:1px dashed var(--line);flex-wrap:wrap}
+.ep:last-child{border-bottom:none}
+.ep .m{font-size:11px;font-weight:700;color:#fff;background:var(--grad);padding:2px 9px;border-radius:6px}
+.ep .u{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;color:var(--ink)}
 footer{text-align:center;color:var(--ink-3);font-size:12px;padding:8px 0 30px}
 footer b{color:var(--ink-2)}
 @media (max-width:640px){
@@ -244,6 +249,8 @@ const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
 let TOKEN = localStorage.getItem('rh_token') || '';
 let SITES = [], ROUTES = [], EDIT_SITE = null, LOGS_TIMER = null, SCAN_RESULT = [];
 
+const EP_LABEL = { openai: 'OpenAI', responses: 'Responses', anthropic: 'Anthropic', gemini: 'Gemini' };
+
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g,
   c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const jsq = (s) => String(s == null ? '' : s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
@@ -278,6 +285,13 @@ function fmtTime(ts) {
   if (!ts) return '-';
   const d = new Date(ts * 1000), p = n => String(n).padStart(2, '0');
   return `${d.getMonth() + 1}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+function fmtBytes(n) {
+  n = n || 0;
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1048576).toFixed(2) + ' MB';
 }
 
 /* ============ 登录 ============ */
@@ -320,9 +334,10 @@ RENDER.overview = async function () {
     const s = await api('/stats?days=7');
     const t = s.totals;
     const rate = t.requests ? Math.round(t.ok / t.requests * 100) : 0;
+    const hit = t.requests ? Math.round(t.cached / t.requests * 100) : 0;
     const max = Math.max(1, ...s.daily.map(d => d.requests));
     const bars = s.daily.map(d =>
-      `<div class="bar-wrap" title="${d.day} · ${d.requests} 次 · ${d.tokens} tokens">
+      `<div class="bar-wrap" title="${d.day} · ${d.requests} 次 · 命中 ${d.cached} · ${d.tokens} tokens">
         <div class="bar" style="height:${Math.max(3, Math.round(d.requests / max * 100))}%"></div>
         <span>${d.day.slice(5)}</span></div>`).join('');
     const rows = s.sites.map(x => {
@@ -340,8 +355,9 @@ RENDER.overview = async function () {
     el.innerHTML = `
       <div class="kpis">
         <div class="kpi glass"><div class="v">${t.today_requests}</div><div class="k">今日请求</div></div>
-        <div class="kpi glass"><div class="v">${t.requests}</div><div class="k">近 7 天请求</div></div>
         <div class="kpi glass"><div class="v">${rate}%</div><div class="k">成功率</div></div>
+        <div class="kpi glass"><div class="v">${hit}%</div><div class="k">近 7 天缓存命中</div></div>
+        <div class="kpi glass"><div class="v">${s.cache.entries}</div><div class="k">缓存条目</div></div>
         <div class="kpi glass"><div class="v">${t.tokens.toLocaleString()}</div><div class="k">近 7 天 Tokens</div></div>
         <div class="kpi glass"><div class="v">${t.sites}</div><div class="k">站点数</div></div>
         <div class="kpi glass"><div class="v">${t.models}</div><div class="k">已配模型</div></div>
@@ -479,7 +495,7 @@ async function quotaSite(id) {
   } catch (e) { toast(e.message, 'err'); }
 }
 
-/* ============ 模型（同步 + 路由） ============ */
+/* ============ 模型 ============ */
 
 RENDER.models = async function () {
   const el = $('#tab-models');
@@ -651,8 +667,19 @@ RENDER.keys = async function () {
         <button class="sm" onclick="toggleKey(${k.id},${k.enabled ? 0 : 1})">${k.enabled ? '停用' : '启用'}</button>
         <button class="sm danger" onclick="delKey(${k.id})">删除</button>
       </td></tr>`).join('');
+    const origin = location.origin;
     el.innerHTML = `
       ${KEYS.length === 0 ? `<div class="banner"><b>当前为开放模式</b>：尚未创建任何 API Key，任何人都可以调用本接口。建议立即创建一个；创建之后，未携带 Key 的请求将被拒绝。</div>` : ''}
+      <div class="card glass"><h2>接口地址</h2>
+        <div class="ep"><span class="m">OpenAI</span><span class="u">POST ${origin}/v1/chat/completions</span></div>
+        <div class="ep"><span class="m">Responses</span><span class="u">POST ${origin}/v1/responses</span></div>
+        <div class="ep"><span class="m">Anthropic</span><span class="u">POST ${origin}/v1/messages</span></div>
+        <div class="ep"><span class="m">Gemini</span><span class="u">POST ${origin}/v1beta/models/{模型}:generateContent</span></div>
+        <div class="note" style="margin-top:12px">
+          OpenAI 系客户端 Base URL 填 <code>${origin}/v1</code>；Anthropic 系填 <code>${origin}</code>；
+          Gemini 系填 <code>${origin}</code>。四种格式共享同一份缓存与路由。
+        </div>
+      </div>
       <div class="card glass"><h2>新建 API Key</h2>
         <div class="row">
           <div><label>备注名</label><input id="k-name" placeholder="例如 我的手机"></div>
@@ -662,7 +689,6 @@ RENDER.keys = async function () {
       </div>
       <div class="card glass">
         <div class="card-head"><h2>密钥列表（${KEYS.length}）</h2></div>
-        <div class="note" style="margin-bottom:12px">客户端 Base URL 填 <code>${location.origin}/v1</code>，Key 填下面任意一个。</div>
         <div class="scroll"><table>
           <thead><tr><th>备注</th><th>Key</th><th>今日</th><th>每日上限</th><th>状态</th><th>最后使用</th><th>操作</th></tr></thead>
           <tbody>${rows || '<tr><td colspan="7" class="empty">还没有密钥</td></tr>'}</tbody>
@@ -720,18 +746,19 @@ async function loadLogs() {
   try {
     const rows = await api('/logs?site_id=' + (site || 0) + '&limit=' + limit);
     $('#log-body').innerHTML = `<table>
-      <thead><tr><th>时间</th><th>站点</th><th>模型</th><th>Key</th><th>尝试</th><th>结果</th><th>耗时</th><th>Tokens</th><th>错误</th></tr></thead>
+      <thead><tr><th>时间</th><th>入口</th><th>来源</th><th>模型</th><th>Key</th><th>尝试</th><th>结果</th><th>耗时</th><th>Tokens</th><th>错误</th></tr></thead>
       <tbody>${rows.map(r => `<tr>
         <td class="mono nowrap">${fmtTime(r.ts)}</td>
-        <td>${esc(r.site_name)}</td>
+        <td>${EP_LABEL[r.endpoint] || esc(r.endpoint || 'OpenAI')}</td>
+        <td>${r.cached ? '<span class="tag cache">缓存</span>' : esc(r.site_name)}</td>
         <td class="mono">${esc(r.model)}</td>
         <td>${esc(r.key_name)}</td>
         <td>#${r.attempt}${r.stream ? ' 流' : ''}</td>
         <td>${r.ok ? '<span class="tag ok">成功</span>' : '<span class="tag err">' + (r.status_code || '失败') + '</span>'}</td>
         <td class="nowrap">${r.latency_ms} ms</td>
         <td>${r.total_tokens || ''}</td>
-        <td class="muted" style="max-width:330px">${esc((r.error || '').slice(0, 150))}</td>
-      </tr>`).join('') || '<tr><td colspan="9" class="empty">暂无日志</td></tr>'}</tbody>
+        <td class="muted" style="max-width:300px">${esc((r.error || '').slice(0, 140))}</td>
+      </tr>`).join('') || '<tr><td colspan="10" class="empty">暂无日志</td></tr>'}</tbody>
     </table>`;
   } catch (e) { $('#log-body').innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
 }
@@ -755,8 +782,16 @@ RENDER.settings = async function () {
   try {
     const s = await api('/settings');
     const acc = await api('/account');
+    const cs = await api('/cache');
     const pwEnv = !!acc.password_from_env;
     const userEnv = !!acc.username_from_env;
+    const eps = Array.isArray(s.cache_endpoints) ? s.cache_endpoints : ['openai'];
+    const epChips = ['openai', 'responses', 'anthropic', 'gemini'].map(e => {
+      const on = eps.indexOf(e) >= 0;
+      return `<label class="model ${on ? 'on' : ''}" data-ep="${e}">
+        <input type="checkbox" ${on ? 'checked' : ''}
+          onchange="this.parentNode.classList.toggle('on', this.checked)"> ${EP_LABEL[e]}</label>`;
+    }).join('');
     el.innerHTML = `
       <div class="card glass"><h2>路由策略</h2>
         <div class="row">
@@ -780,6 +815,36 @@ RENDER.settings = async function () {
           <div style="max-width:240px"><label>自动同步间隔（秒）</label><input id="st-si" type="number" value="${s.auto_sync_interval}"></div>
         </div>
         <div class="gap"><button class="primary" onclick="saveSettings()">保存设置</button></div>
+      </div>
+
+      <div class="card glass"><h2>响应缓存</h2>
+        <div class="note" style="margin-bottom:14px">
+          缓存在「统一请求体」这一层，所以四种客户端格式<b>共享同一份缓存</b>：
+          用一个格式问过的问题，换另一种格式再问也能命中。<br>
+          命中缓存不会消耗中转站额度，也不计入站点的每日限额。
+        </div>
+        <div class="row">
+          <div style="max-width:200px"><label>缓存开关</label><select id="ca-on">
+            <option value="1" ${s.cache_enabled ? 'selected' : ''}>开</option>
+            <option value="0" ${!s.cache_enabled ? 'selected' : ''}>关</option></select></div>
+          <div style="max-width:220px"><label>仅缓存 temperature = 0</label><select id="ca-det">
+            <option value="1" ${s.cache_only_deterministic ? 'selected' : ''}>是（推荐）</option>
+            <option value="0" ${!s.cache_only_deterministic ? 'selected' : ''}>否（只要请求体一致就命中）</option></select></div>
+          <div style="max-width:200px"><label>有效期（秒，0=永久）</label><input id="ca-ttl" type="number" value="${s.cache_ttl}"></div>
+          <div style="max-width:180px"><label>最大条目数</label><input id="ca-max" type="number" value="${s.cache_max_entries}"></div>
+        </div>
+        <div class="gap">
+          <label>允许读写缓存的入口（不勾则完全绕过缓存）</label>
+          <div class="models" id="ca-eps">${epChips}</div>
+        </div>
+        <div class="gap">
+          <button class="primary" onclick="saveSettings()">保存设置</button>
+          <button onclick="purgeCache()">清理过期</button>
+          <button class="danger" onclick="clearCache()">清空缓存</button>
+          <span class="muted" style="margin-left:6px">
+            现有 ${cs.entries} 条 / ${fmtBytes(cs.bytes)}，累计命中 ${cs.hits} 次
+          </span>
+        </div>
       </div>
 
       <div class="card glass"><h2>面板账号</h2>
@@ -816,14 +881,37 @@ RENDER.settings = async function () {
 };
 
 async function saveSettings() {
+  const eps = [];
+  $$('#ca-eps .model').forEach(lb => {
+    const cb = lb.querySelector('input');
+    if (cb && cb.checked) eps.push(lb.dataset.ep);
+  });
   const payload = {
     strategy: $('#st-strategy').value, max_attempts: parseInt($('#st-max').value, 10),
     circuit_threshold: parseInt($('#st-th').value, 10), circuit_cooldown: parseInt($('#st-cool').value, 10),
     quota_check_interval: parseInt($('#st-q').value, 10), inject_stream_usage: $('#st-inject').value === '1',
-    auto_sync_models: $('#st-sync').value === '1', auto_sync_interval: parseInt($('#st-si').value, 10)
+    auto_sync_models: $('#st-sync').value === '1', auto_sync_interval: parseInt($('#st-si').value, 10),
+    cache_enabled: $('#ca-on').value === '1', cache_endpoints: eps,
+    cache_only_deterministic: $('#ca-det').value === '1',
+    cache_ttl: parseInt($('#ca-ttl').value || '0', 10),
+    cache_max_entries: parseInt($('#ca-max').value || '0', 10)
   };
-  try { await api('/settings', { method: 'PUT', body: JSON.stringify(payload) }); toast('已保存', 'ok'); }
+  try { await api('/settings', { method: 'PUT', body: JSON.stringify(payload) });
+    toast('已保存', 'ok'); RENDER.settings(); }
   catch (e) { toast(e.message, 'err'); }
+}
+
+async function clearCache() {
+  if (!confirm('清空全部缓存？')) return;
+  try { await api('/cache/clear', { method: 'POST' }); toast('缓存已清空', 'ok'); RENDER.settings(); }
+  catch (e) { toast(e.message, 'err'); }
+}
+
+async function purgeCache() {
+  try {
+    const r = await api('/cache/purge', { method: 'POST' });
+    toast(`已清理 ${r.removed} 条过期缓存`, 'ok'); RENDER.settings();
+  } catch (e) { toast(e.message, 'err'); }
 }
 
 async function saveAccount() {
@@ -834,8 +922,7 @@ async function saveAccount() {
   };
   try {
     await api('/account', { method: 'PUT', body: JSON.stringify(payload) });
-    toast('已保存', 'ok');
-    RENDER.settings();
+    toast('已保存', 'ok'); RENDER.settings();
   } catch (e) { toast(e.message, 'err'); }
 }
 
