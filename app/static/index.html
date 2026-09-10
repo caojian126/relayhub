@@ -8,14 +8,11 @@
 :root{
   --ink:#2c2f45; --ink-2:#5a5f7a; --ink-3:#8b90a8;
   --glass:rgba(255,255,255,.55);
-  --glass-2:rgba(255,255,255,.38);
   --glass-brd:rgba(255,255,255,.72);
   --line:rgba(120,120,170,.16);
-  --acc:#e07aa6; --acc2:#8f7bf5;
   --grad:linear-gradient(135deg,#f087b5 0%,#a98bf5 100%);
   --ok:#2fa47a; --err:#e05560; --warn:#d9962b;
   --sh:0 10px 34px rgba(96,86,160,.13);
-  --sh-sm:0 4px 14px rgba(96,86,160,.10);
   --r:24px; --r-sm:16px;
 }
 *{box-sizing:border-box;margin:0;padding:0}
@@ -76,6 +73,7 @@ input,select,textarea{
 }
 input:focus,select:focus,textarea:focus{outline:none;border-color:rgba(190,140,240,.8);
   box-shadow:0 0 0 4px rgba(200,150,245,.18), inset 0 1px 2px rgba(96,86,160,.05)}
+input:disabled{opacity:.55;cursor:not-allowed}
 input::placeholder{color:var(--ink-3)}
 label{display:block;font-size:12px;color:var(--ink-3);margin-bottom:6px;font-weight:500}
 .wrap{max-width:1360px;margin:0 auto;padding:22px 22px 60px}
@@ -401,6 +399,7 @@ RENDER.sites = async function () {
       </div>
       <div class="card glass">
         <div class="card-head"><h2>站点列表（${SITES.length}）</h2></div>
+        <div class="note" style="margin-bottom:12px">各站的 API Key 保存在持久卷的数据库里，不经过环境变量。</div>
         <div class="scroll"><table>
           <thead><tr><th>名称</th><th>地址</th><th>Key</th><th>优先级</th><th>状态</th><th>今日</th><th>剩余</th><th>额度查询</th><th>操作</th></tr></thead>
           <tbody>${rows || '<tr><td colspan="9" class="empty">还没有站点</td></tr>'}</tbody>
@@ -755,7 +754,9 @@ RENDER.settings = async function () {
   const el = $('#tab-settings');
   try {
     const s = await api('/settings');
-    const cfg = await api('/config');
+    const acc = await api('/account');
+    const pwEnv = !!acc.password_from_env;
+    const userEnv = !!acc.username_from_env;
     el.innerHTML = `
       <div class="card glass"><h2>路由策略</h2>
         <div class="row">
@@ -780,18 +781,29 @@ RENDER.settings = async function () {
         </div>
         <div class="gap"><button class="primary" onclick="saveSettings()">保存设置</button></div>
       </div>
-      <div class="card glass"><h2>账号与配置文件</h2>
+
+      <div class="card glass"><h2>面板账号</h2>
         <div class="note" style="margin-bottom:14px">
-          账号、密码与签名密钥保存在持久卷中的配置文件里，修改后重启服务即可生效，<b>不需要重新部署</b>。<br>
-          文件路径：<code>${esc(cfg.path)}</code>${cfg.exists ? '' : ' <span class="tag warn">尚未生成</span>'}
+          <b>面板密码建议放在环境变量 <code>ADMIN_PASSWORD</code> 里。</b>设置后它就是唯一来源，每次启动都会校正；
+          万一忘记密码，去部署平台改一下环境变量再重启服务就能找回，不会被锁在面板外面。<br>
+          各中转站的 API Key 不在环境变量里，它们保存在持久卷的数据库里。
         </div>
-        <div class="row"><div><label>用户名</label><input id="cf-user" value="${esc(cfg.username)}"></div></div>
-        <div class="row gap">
-          <div><label>原密码</label><input id="cf-old" type="password" placeholder="仅修改密码时填写"></div>
-          <div><label>新密码（至少 6 位）</label><input id="cf-new" type="password" placeholder="留空表示不修改"></div>
+        <div class="row" style="margin-bottom:14px">
+          <div><span class="tag ${pwEnv ? 'acc' : 'ok'}">密码来源：${pwEnv ? '环境变量 ADMIN_PASSWORD' : '数据库（可在本页修改）'}</span></div>
+          <div><span class="tag ${userEnv ? 'acc' : 'ok'}">账号来源：${userEnv ? '环境变量 ADMIN_USERNAME' : '数据库'}</span></div>
         </div>
-        <div class="gap"><button class="primary" onclick="saveAccount()">保存并写入配置文件</button></div>
+        <div class="row"><div><label>用户名</label><input id="cf-user" value="${esc(acc.username)}" ${userEnv ? 'disabled' : ''}></div></div>
+        ${pwEnv
+          ? `<div class="note" style="margin-top:12px">密码由环境变量管理。要修改请到部署平台调整 <code>ADMIN_PASSWORD</code>，然后重启服务。</div>`
+          : `<div class="row gap">
+               <div><label>原密码</label><input id="cf-old" type="password"></div>
+               <div><label>新密码（至少 6 位）</label><input id="cf-new" type="password" placeholder="留空表示不修改"></div>
+             </div>`}
+        <div class="gap">
+          <button class="primary" onclick="saveAccount()" ${(pwEnv && userEnv) ? 'disabled' : ''}>保存</button>
+        </div>
       </div>
+
       <div class="card glass"><h2>备份与恢复</h2>
         <div class="note" style="margin-bottom:14px">导出内容包含站点、API Key、路由与设置，导出的 JSON 请自行妥善保管。</div>
         <div class="row" style="max-width:560px">
@@ -815,11 +827,15 @@ async function saveSettings() {
 }
 
 async function saveAccount() {
-  const payload = { username: $('#cf-user').value.trim(),
-    old_password: $('#cf-old').value, new_password: $('#cf-new').value };
+  const payload = {
+    username: $('#cf-user').value.trim(),
+    old_password: $('#cf-old') ? $('#cf-old').value : '',
+    new_password: $('#cf-new') ? $('#cf-new').value : ''
+  };
   try {
-    await api('/config', { method: 'PUT', body: JSON.stringify(payload) });
-    toast('已保存并写入配置文件', 'ok'); $('#cf-old').value = ''; $('#cf-new').value = '';
+    await api('/account', { method: 'PUT', body: JSON.stringify(payload) });
+    toast('已保存', 'ok');
+    RENDER.settings();
   } catch (e) { toast(e.message, 'err'); }
 }
 
