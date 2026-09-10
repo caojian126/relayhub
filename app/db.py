@@ -89,6 +89,8 @@ CREATE TABLE IF NOT EXISTS request_logs (
   key_name          TEXT    NOT NULL DEFAULT '',
   attempt           INTEGER NOT NULL DEFAULT 1,
   ok                INTEGER NOT NULL DEFAULT 0,
+  cached            INTEGER NOT NULL DEFAULT 0,
+  endpoint          TEXT    NOT NULL DEFAULT 'openai',
   status_code       INTEGER,
   latency_ms        INTEGER NOT NULL DEFAULT 0,
   prompt_tokens     INTEGER NOT NULL DEFAULT 0,
@@ -98,20 +100,46 @@ CREATE TABLE IF NOT EXISTS request_logs (
   error             TEXT    NOT NULL DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS cache_entries (
+  key            TEXT PRIMARY KEY,
+  model          TEXT NOT NULL DEFAULT '',
+  request_body   TEXT NOT NULL DEFAULT '',
+  response_json  TEXT NOT NULL DEFAULT '',
+  stream         INTEGER NOT NULL DEFAULT 0,
+  created_at     REAL NOT NULL,
+  expires_at     REAL NOT NULL DEFAULT 0,
+  hits           INTEGER NOT NULL DEFAULT 0,
+  last_hit_at    REAL NOT NULL DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS idx_logs_ts    ON request_logs(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_logs_site  ON request_logs(site_id, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_routes_mdl ON routes(model);
+CREATE INDEX IF NOT EXISTS idx_cache_exp  ON cache_entries(expires_at);
 """
 
 DEFAULT_SETTINGS = {
-    "strategy": "balanced",            # balanced | priority | round_robin
-    "max_attempts": 3,                 # 单次请求最多尝试几个上游
-    "circuit_threshold": 3,            # 连续失败几次触发熔断
-    "circuit_cooldown": 600,           # 熔断冷却秒数
-    "inject_stream_usage": True,       # 流式时自动加 include_usage，便于统计 token
-    "quota_check_interval": 3600,      # 额度巡检间隔（秒）
-    "auto_sync_models": True,          # 定时自动同步上游模型
-    "auto_sync_interval": 86400,       # 自动同步间隔（秒）
+    "strategy": "balanced",             # balanced | priority | round_robin
+    "max_attempts": 3,                  # 单次请求最多尝试几个上游
+    "circuit_threshold": 3,             # 连续失败几次触发熔断
+    "circuit_cooldown": 600,            # 熔断冷却秒数
+    "inject_stream_usage": True,        # 流式时自动加 include_usage，便于统计 token
+    "quota_check_interval": 3600,       # 额度巡检间隔（秒）
+    "auto_sync_models": True,           # 定时自动同步上游模型
+    "auto_sync_interval": 86400,        # 自动同步间隔（秒）
+    "cache_enabled": False,             # 响应缓存总开关
+    "cache_endpoints": ["openai"],      # 允许读写缓存的入口
+    "cache_only_deterministic": True,   # 仅缓存 temperature=0 的请求
+    "cache_ttl": 3600,                  # 缓存有效期（秒），0 = 永不过期
+    "cache_max_entries": 1000,          # 最大缓存条目数
+}
+
+# 建表后需要补充的列（兼容旧数据库）
+MIGRATIONS = {
+    "request_logs": {
+        "cached": "INTEGER NOT NULL DEFAULT 0",
+        "endpoint": "TEXT NOT NULL DEFAULT 'openai'",
+    },
 }
 
 
@@ -164,10 +192,20 @@ def set_setting(key, value):
     )
 
 
+def _migrate(conn):
+    for table, cols in MIGRATIONS.items():
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        have = {r["name"] for r in rows}
+        for col, decl in cols.items():
+            if col not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+
+
 def init_db():
     conn = _conn()
     with _write_lock:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         conn.commit()
     for k, v in DEFAULT_SETTINGS.items():
         if query_one("SELECT 1 FROM settings WHERE k=?", (k,)) is None:
