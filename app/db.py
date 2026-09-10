@@ -110,6 +110,8 @@ DEFAULT_SETTINGS = {
     "circuit_cooldown": 600,           # 熔断冷却秒数
     "inject_stream_usage": True,       # 流式时自动加 include_usage，便于统计 token
     "quota_check_interval": 3600,      # 额度巡检间隔（秒）
+    "auto_sync_models": True,          # 定时自动同步上游模型
+    "auto_sync_interval": 86400,       # 自动同步间隔（秒）
 }
 
 

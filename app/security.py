@@ -1,11 +1,10 @@
 import base64
 import hashlib
 import hmac
-import os
 import secrets
 import time
 
-from . import db
+from . import db, fileconfig
 from .config import ADMIN_PASSWORD, ADMIN_USERNAME
 
 ITERATIONS = 120_000
@@ -14,7 +13,7 @@ ITERATIONS = 120_000
 def _secret():
     v = db.get_setting("secret_key")
     if not v:
-        v = os.getenv("SECRET_KEY") or secrets.token_urlsafe(48)
+        v = fileconfig.get(["server", "secret_key"]) or secrets.token_urlsafe(48)
         db.set_setting("secret_key", v)
     return v
 
@@ -71,24 +70,36 @@ def check_login(username, password):
 
 
 def seed_admin():
-    row = db.query_one("SELECT COUNT(*) AS c FROM admins")
-    if row and row["c"]:
+    """以 /data/config.json 为准初始化管理员账号。"""
+    cfg = fileconfig.load()
+    admin = cfg.get("admin") if isinstance(cfg.get("admin"), dict) else {}
+    file_username = (admin.get("username") or "").strip() or ADMIN_USERNAME
+    file_password = admin.get("password") or ""
+
+    secret_key = (cfg.get("server") or {}).get("secret_key")
+    if secret_key:
+        db.set_setting("secret_key", secret_key)
+
+    row = db.query_one("SELECT * FROM admins ORDER BY id LIMIT 1")
+
+    if row is None:
+        password = file_password or ADMIN_PASSWORD or secrets.token_urlsafe(12)
+        db.execute(
+            "INSERT INTO admins(username, password_hash, created_at) VALUES(?, ?, ?)",
+            (file_username, hash_password(password), time.time()),
+        )
         return
-    password = ADMIN_PASSWORD or secrets.token_urlsafe(12)
-    db.execute(
-        "INSERT INTO admins(username, password_hash, created_at) VALUES(?, ?, ?)",
-        (ADMIN_USERNAME, hash_password(password), time.time()),
-    )
-    print("=" * 64, flush=True)
-    print(f"[RelayHub] 管理员账号: {ADMIN_USERNAME}", flush=True)
-    if ADMIN_PASSWORD:
-        print("[RelayHub] 密码来自环境变量 ADMIN_PASSWORD", flush=True)
-    else:
-        print(f"[RelayHub] 随机初始密码: {password}", flush=True)
-        print("[RelayHub] 登录后请到「设置」里改掉它", flush=True)
-    if not os.getenv("SECRET_KEY"):
-        print("[RelayHub] 建议设置环境变量 SECRET_KEY，否则每次重建容器会掉登录态", flush=True)
-    print("=" * 64, flush=True)
+
+    # 配置文件是唯一事实来源：密码/用户名与文件中不一致就同步过来
+    if file_password and not verify_password(file_password, row["password_hash"]):
+        db.execute(
+            "UPDATE admins SET password_hash=? WHERE id=?",
+            (hash_password(file_password), row["id"]),
+        )
+        print("[RelayHub] 已按 config.json 更新管理员密码", flush=True)
+    if file_username and file_username != row["username"]:
+        db.execute("UPDATE admins SET username=? WHERE id=?", (file_username, row["id"]))
+        print(f"[RelayHub] 已按 config.json 更新管理员账号为 {file_username}", flush=True)
 
 
 def gen_api_key():

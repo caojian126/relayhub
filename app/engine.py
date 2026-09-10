@@ -14,6 +14,13 @@ def norm_base(url):
     return u
 
 
+def upstream_headers(site):
+    headers = {"Content-Type": "application/json"}
+    if site.get("api_key"):
+        headers["Authorization"] = "Bearer " + site["api_key"]
+    return headers
+
+
 def today():
     return time.strftime("%Y-%m-%d", time.localtime())
 
