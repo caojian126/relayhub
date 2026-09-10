@@ -322,6 +322,45 @@ def main():
     st, keys_now = admin("/keys")
     check("覆盖导入会清掉旧网关 Key", len(keys_now) == 0, len(keys_now))
 
+    print("\n=== 12. 路由批量操作 ===", flush=True)
+    st, sites_now = admin("/sites")
+    sid = sites_now[0]["id"]
+    admin("/models/import", "POST",
+          {"items": [{"site_id": sid, "model": m}
+                     for m in ("gpt-5", "gpt-5-mini", "gemini-2.5-pro")]})
+    st, rs = admin("/routes")
+    marks = ("gpt-5", "gpt-5-mini", "gemini-2.5-pro")
+    ids = [x["id"] for x in rs if x["model"] in marks]
+    check("批量前置：3 条路由就绪", len(ids) == 3, len(ids))
+
+    st, r = admin("/routes/batch", "POST", {"ids": ids, "action": "disable"})
+    check("批量停用", st == 200 and r.get("affected") == 3, r)
+    st, rs = admin("/routes")
+    check("停用已落库", all(not x["enabled"] for x in rs if x["id"] in ids))
+
+    st, r = admin("/routes/batch", "POST", {"ids": ids, "action": "enable"})
+    check("批量启用", st == 200 and r.get("affected") == 3, r)
+
+    st, r = admin("/routes/batch", "POST", {"ids": ids, "action": "limit", "value": 7})
+    check("批量设每日上限", st == 200 and r.get("affected") == 3, r)
+    st, rs = admin("/routes")
+    check("上限已落库为 7", all(x["daily_limit"] == 7 for x in rs if x["id"] in ids))
+
+    st, r = admin("/routes/batch", "POST", {"ids": [], "action": "delete"})
+    check("空 ids 被拒绝", st == 400, st)
+    st, r = admin("/routes/batch", "POST", {"ids": ids, "action": "炸掉"})
+    check("未知 action 被拒绝", st == 400, st)
+
+    st, r = admin("/routes/batch", "POST", {"ids": [ids[0]], "action": "delete"})
+    check("批量删除 1 条", st == 200 and r.get("affected") == 1, r)
+    st, rs = admin("/routes")
+    check("删除已落库", ids[0] not in [x["id"] for x in rs])
+
+    print("\n=== 13. 自动同步必须默认关闭 ===", flush=True)
+    st, s = admin("/settings")
+    check("auto_sync_models 默认是关的（不会不打招呼就把上游模型全导入）",
+          st == 200 and s.get("auto_sync_models") is False, s.get("auto_sync_models"))
+
     print("\n" + "=" * 56, flush=True)
     if FAILED:
         print(f"结果：{len(FAILED)} 项失败", flush=True)

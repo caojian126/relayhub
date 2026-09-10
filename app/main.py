@@ -1204,6 +1204,45 @@ async def delete_route(route_id: int, request: Request):
     return {"ok": True}
 
 
+@app.post("/admin/api/routes/batch")
+async def batch_routes(request: Request, payload: dict = Body(...)):
+    """路由批量操作。
+
+    action: delete / enable / disable / limit（limit 时用 value 指定每日上限）
+    一次一条 SQL 搞定，避免前端发几百个请求。
+    """
+    require_admin(request)
+    raw = payload.get("ids") or []
+    ids = []
+    for i in raw:
+        try:
+            ids.append(int(i))
+        except (TypeError, ValueError):
+            continue
+    if not ids:
+        raise HTTPException(400, "没有选择任何路由")
+    if len(ids) > 2000:
+        raise HTTPException(400, "一次最多操作 2000 条")
+
+    action = str(payload.get("action") or "").strip()
+    marks = ",".join("?" * len(ids))
+
+    if action == "delete":
+        cur = db.execute(f"DELETE FROM routes WHERE id IN ({marks})", ids)
+        return {"ok": True, "action": action, "affected": cur.rowcount}
+    if action in ("enable", "disable"):
+        cur = db.execute(
+            f"UPDATE routes SET enabled=? WHERE id IN ({marks})",
+            [1 if action == "enable" else 0] + ids)
+        return {"ok": True, "action": action, "affected": cur.rowcount}
+    if action == "limit":
+        cur = db.execute(
+            f"UPDATE routes SET daily_limit=? WHERE id IN ({marks})",
+            [int(payload.get("value") or 0)] + ids)
+        return {"ok": True, "action": action, "affected": cur.rowcount}
+    raise HTTPException(400, "不支持的批量操作（只支持 delete / enable / disable / limit）")
+
+
 # -------- API Key
 
 @app.get("/admin/api/keys")

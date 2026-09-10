@@ -199,6 +199,8 @@ footer b{color:var(--ink-2)}
   color:var(--ink-3);font-size:11.5px;padding:8px 12px;border-radius:12px}
 .msg.meta b{color:var(--ink-2)}
 .chain{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+.batch{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:12px;
+  padding:10px 12px;border-radius:14px;background:rgba(255,255,255,.42);border:1px solid var(--line)}
 </style>
 </head>
 <body>
@@ -532,19 +534,25 @@ RENDER.models = async function () {
       const targets = groups[model].map(r => {
         const over = r.daily_limit > 0 && r.today_count >= r.daily_limit;
         return `<tr>
-          <td style="width:200px">${esc(r.site_name)}${r.site_enabled ? '' : ' <span class="tag dim">站点停用</span>'}</td>
-          <td style="width:230px"><input value="${esc(r.upstream_model)}" placeholder="同名" id="up-${r.id}"></td>
-          <td style="width:130px"><input type="number" min="0" value="${r.daily_limit}" id="lim-${r.id}"></td>
-          <td style="width:110px">${r.today_count}${over ? ' <span class="tag err">用尽</span>' : ''}</td>
-          <td style="width:90px">${r.enabled ? '<span class="tag ok">启用</span>' : '<span class="tag dim">停用</span>'}</td>
+          <td style="width:34px"><input type="checkbox" class="rpick" data-id="${r.id}"
+            onchange="updateRouteCount()"></td>
+          <td style="width:180px">${esc(r.site_name)}${r.site_enabled ? '' : ' <span class="tag dim">站点停用</span>'}</td>
+          <td style="width:210px"><input value="${esc(r.upstream_model)}" placeholder="同名" id="up-${r.id}"></td>
+          <td style="width:110px"><input type="number" min="0" value="${r.daily_limit}" id="lim-${r.id}"></td>
+          <td style="width:96px">${r.today_count}${over ? ' <span class="tag err">用尽</span>' : ''}</td>
+          <td style="width:80px">${r.enabled ? '<span class="tag ok">启用</span>' : '<span class="tag dim">停用</span>'}</td>
           <td class="nowrap">
             <button class="sm primary" onclick="saveRoute(${r.id})">保存</button>
             <button class="sm danger" onclick="delRoute(${r.id})">移除</button>
           </td></tr>`;
       }).join('');
-      return `<tr><td class="mono" style="vertical-align:top;padding-top:16px;font-size:13px"><b>${esc(model)}</b></td>
-        <td colspan="5" style="padding:6px 0"><table style="margin:0">
-        <thead><tr><th>站点</th><th>上游模型名</th><th>每日上限</th><th>今日</th><th>状态</th><th>操作</th></tr></thead>
+      const gids = groups[model].map(r => r.id);
+      return `<tr><td class="mono" style="vertical-align:top;padding-top:16px;font-size:13px">
+          <b>${esc(model)}</b><br>
+          <button class="sm ghost" style="margin-top:6px" onclick="pickGroup([${gids}], true)">全选本组</button>
+        </td>
+        <td colspan="6" style="padding:6px 0"><table style="margin:0">
+        <thead><tr><th></th><th>站点</th><th>上游模型名</th><th>每日上限</th><th>今日</th><th>状态</th><th>操作</th></tr></thead>
         <tbody>${targets}</tbody></table></td></tr>`;
     }).join('');
     el.innerHTML = `
@@ -553,7 +561,7 @@ RENDER.models = async function () {
           <h2>从上游拉取模型</h2>
           <button class="primary" onclick="scanAll()">扫描全部站点</button>
         </div>
-        <div class="note">直接从各中转站的 <code>/v1/models</code> 拉取模型列表，勾选后一键导入，不再需要手动填写模型名。<br>
+        <div class="note">只想处理某一个站，去「站点」页点该站的「拉模型」，会弹出勾选框，默认不勾选。<br>
         同一个模型名导入到多个站点后，请求会自动在这些站点之间负载与故障切换。重复扫描不会覆盖已有配置。</div>
       </div>
       <div class="card glass">
@@ -561,10 +569,20 @@ RENDER.models = async function () {
           <h2>路由与限额（${Object.keys(groups).length} 个模型 / ${ROUTES.length} 条路由）</h2>
           <button class="ghost sm" onclick="addRouteManually()">手动添加</button>
         </div>
+        <div class="batch">
+          <label class="model" style="padding:5px 12px"><input type="checkbox" id="pick-all"
+            onchange="pickAll(this.checked)"> 全选（${ROUTES.length}）</label>
+          <span class="muted">已选 <b id="r-count">0</b> 条</span>
+          <button class="sm" onclick="batchRoutes('enable')">批量启用</button>
+          <button class="sm" onclick="batchRoutes('disable')">批量停用</button>
+          <button class="sm" onclick="batchLimit()">批量设上限</button>
+          <button class="sm danger" onclick="batchRoutes('delete')">批量删除</button>
+        </div>
         <div class="scroll"><table>
           <tbody>${rows || '<tr><td class="empty">还没有路由，点击上方「扫描全部站点」导入</td></tr>'}</tbody>
         </table></div>
       </div>`;
+    updateRouteCount();
   } catch (e) { el.innerHTML = `<div class="card glass empty">加载失败：${esc(e.message)}</div>`; }
 };
 
@@ -714,6 +732,66 @@ async function doAddRoute() {
   try { await api('/routes', { method: 'POST', body: JSON.stringify(payload) });
     toast('已添加', 'ok'); closeSheet(); RENDER.models(); }
   catch (e) { toast(e.message, 'err'); }
+}
+
+/* ---- 路由批量编辑 ---- */
+
+function routeBoxes() { return $$('#tab-models .rpick'); }
+
+function pickedRouteIds() {
+  return routeBoxes().filter(cb => cb.checked).map(cb => parseInt(cb.dataset.id, 10));
+}
+
+function updateRouteCount() {
+  const n = pickedRouteIds().length;
+  const c = $('#r-count');
+  if (c) c.textContent = n;
+  const all = routeBoxes();
+  const pa = $('#pick-all');
+  if (pa) {
+    pa.checked = all.length > 0 && n === all.length;
+    pa.indeterminate = n > 0 && n < all.length;
+  }
+}
+
+function pickAll(on) {
+  routeBoxes().forEach(cb => { cb.checked = on; });
+  updateRouteCount();
+}
+
+function pickGroup(ids, on) {
+  ids.forEach(id => {
+    const cb = $('#tab-models .rpick[data-id="' + id + '"]');
+    if (cb) cb.checked = on;
+  });
+  updateRouteCount();
+}
+
+async function batchRoutes(action) {
+  const ids = pickedRouteIds();
+  if (!ids.length) return toast('先勾选要操作的路由', 'err');
+  if (action === 'delete'
+      && !confirm(`删除这 ${ids.length} 条路由？\n（只删路由，不影响站点本身）`)) return;
+  try {
+    const r = await api('/routes/batch', { method: 'POST', body: JSON.stringify({ ids, action }) });
+    toast(`已处理 ${r.affected} 条`, 'ok');
+    RENDER.models();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function batchLimit() {
+  const ids = pickedRouteIds();
+  if (!ids.length) return toast('先勾选要操作的路由', 'err');
+  const v = prompt(`把这 ${ids.length} 条路由的每日上限设为多少？\n0 = 不限制`, '0');
+  if (v === null) return;
+  const n = parseInt(v, 10);
+  if (isNaN(n) || n < 0) return toast('请输入 0 或正整数', 'err');
+  try {
+    const r = await api('/routes/batch', { method: 'POST',
+      body: JSON.stringify({ ids, action: 'limit', value: n }) });
+    toast(`已把 ${r.affected} 条的上限设为 ${n}`, 'ok');
+    RENDER.models();
+  } catch (e) { toast(e.message, 'err'); }
 }
 
 /* ============ 密钥 ============ */

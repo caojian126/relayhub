@@ -147,7 +147,8 @@ DEFAULT_SETTINGS = {
     "circuit_cooldown": 600,            # 熔断冷却秒数
     "inject_stream_usage": True,        # 流式时自动加 include_usage，便于统计 token
     "quota_check_interval": 3600,       # 额度巡检间隔（秒）
-    "auto_sync_models": True,           # 定时自动同步上游模型
+    "auto_sync_models": False,          # 定时自动同步上游模型。默认关：
+                                        # 不许不打招呼就把上游几百个模型全导进路由
     "auto_sync_interval": 86400,        # 自动同步间隔（秒）
     "cache_enabled": False,             # 响应缓存总开关
     "cache_endpoints": ["openai"],      # 允许读写缓存的入口
@@ -249,6 +250,18 @@ def init_db():
     for k, v in DEFAULT_SETTINGS.items():
         if query_one("SELECT 1 FROM settings WHERE k=?", (k,)) is None:
             set_setting(k, v)
+    _migrate_settings()
+
+
+def _migrate_settings():
+    """一次性的设置项迁移。每项只做一次，用哨兵值记住做过没有。"""
+    # v0.5.1：auto_sync_models 的默认值从「开」改成「关」。
+    # 老库里存的是 True，启动 45 秒后会把上游所有模型统统导进路由，
+    # 跟「用户自己挑模型」的设计直接冲突 —— 所以这里强制关一次。
+    # 真想用的人去「设置」页自己打开。
+    if get_setting("_mig_auto_sync_off") is None:
+        set_setting("auto_sync_models", False)
+        set_setting("_mig_auto_sync_off", True)
     sync_groups()
 
 
