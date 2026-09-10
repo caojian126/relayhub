@@ -42,10 +42,6 @@ def is_cacheable(body):
                 return False
         except (TypeError, ValueError):
             return False
-    # 带随机性开关的请求不缓存
-    for k in ("seed",):
-        if body.get(k) is not None:
-            return True
     return True
 
 
@@ -113,10 +109,10 @@ def trim():
 
 
 def purge_expired():
-    row = db.execute(
+    cur = db.execute(
         "DELETE FROM cache_entries WHERE expires_at > 0 AND expires_at < ?", (time.time(),)
     )
-    return row.rowcount
+    return cur.rowcount
 
 
 def clear():
@@ -129,8 +125,10 @@ def delete(key):
 
 def stats():
     row = db.query_one(
-        "SELECT COUNT(*) AS n, COALESCE(SUM(hits),0) AS h, COALESCE(SUM(LENGTH(response_json)),0) AS sz
-         FROM cache_entries"
+        """SELECT COUNT(*) AS n,
+                  COALESCE(SUM(hits), 0) AS h,
+                  COALESCE(SUM(LENGTH(response_json)), 0) AS sz
+           FROM cache_entries"""
     )
     return {
         "entries": int(row["n"]) if row else 0,

@@ -15,7 +15,7 @@ from .config import CONNECT_TIMEOUT, REQUEST_TIMEOUT
 from .db import DEFAULT_SETTINGS
 
 STATIC_DIR = Path(__file__).parent / "static"
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 
 SSE_HEADERS = {
     "Cache-Control": "no-cache",
@@ -68,7 +68,9 @@ def _bearer(request: Request):
     auth = request.headers.get("Authorization", "") or ""
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
-    # Gemini 客户端习惯把 key 放在 query 里
+    key = request.headers.get("x-api-key", "") or ""
+    if key:
+        return key.strip()
     return request.query_params.get("key", "") or ""
 
 
@@ -129,7 +131,8 @@ def _error_payload(endpoint, message):
         return fm.sse("error", {"type": "error",
                                 "error": {"type": "api_error", "message": message}})
     if endpoint == "gemini":
-        return fm.sse_data({"error": {"code": 502, "message": message, "status": "UNAVAILABLE"}})
+        return fm.sse_data({"error": {"code": 502, "message": message,
+                                        "status": "UNAVAILABLE"}})
     return fm.sse_data({"error": {"message": message, "type": "relayhub_error"}})
 
 
@@ -137,7 +140,6 @@ async def handle(request: Request, endpoint, model_action=None):
     body = await _read_json(request)
     key_info = auth_api_key(request)
 
-    # ---- 确定模型与是否流式 ----
     forced_stream = None
     if endpoint == "gemini":
         name, _, action = (model_action or "").partition(":")
@@ -151,7 +153,6 @@ async def handle(request: Request, endpoint, model_action=None):
 
     want_stream = bool(forced_stream) or bool(body.get("stream"))
 
-    # ---- 翻译成统一 OpenAI 请求体 ----
     if endpoint == "gemini":
         unified = fm.gemini_to_openai(body, model)
     else:
@@ -169,7 +170,6 @@ async def handle(request: Request, endpoint, model_action=None):
     client = request.app.state.client
     key = chat.cache_key_for(endpoint, unified)
 
-    # ---- 缓存命中 ----
     if key:
         hit = chat.lookup(key)
         if hit:
@@ -184,7 +184,6 @@ async def handle(request: Request, endpoint, model_action=None):
                 )
             return JSONResponse(fm.RENDERERS[endpoint](unified_resp, model))
 
-    # ---- 非流式 ----
     if not want_stream:
         try:
             unified_resp, _ = await chat.complete(client, unified, key_info, endpoint)
@@ -195,7 +194,6 @@ async def handle(request: Request, endpoint, model_action=None):
             raise HTTPException(502, str(e))
         return JSONResponse(fm.RENDERERS[endpoint](unified_resp, model))
 
-    # ---- 流式 ----
     return StreamingResponse(
         _render_stream(endpoint, client, unified, key_info, model, key),
         media_type="text/event-stream", headers=SSE_HEADERS,
@@ -210,9 +208,7 @@ async def _render_stream(endpoint, client, unified, key_info, model, key):
         try:
             async for ev in chat.stream(client, unified, key_info, endpoint, holder):
                 yield ev.raw
-        except chat.UpstreamFailed as e:
-            yield _error_payload(endpoint, str(e))
-        except chat.NoUpstream as e:
+        except (chat.UpstreamFailed, chat.NoUpstream) as e:
             yield _error_payload(endpoint, str(e))
         else:
             chat.store(key, unified, holder.get("final"), stream=True)
@@ -243,16 +239,15 @@ async def _render_stream(endpoint, client, unified, key_info, model, key):
             yield fm.sse("content_block_stop", {"type": "content_block_stop", "index": 0})
             yield _error_payload(endpoint, str(e))
             return
-        finally:
-            pass
         yield fm.sse("content_block_stop", {"type": "content_block_stop", "index": 0})
         final = holder.get("final") or {}
         usage = final.get("usage") or {}
-        stop = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}.get(
-            finish_reason, "end_turn")
-        yield fm.sse("message_delta", {"type": "message_delta",
-                                       "delta": {"stop_reason": stop, "stop_sequence": None},
-                                       "usage": {"output_tokens": int(usage.get("completion_tokens") or 0)}})
+        stop = {"stop": "end_turn", "length": "max_tokens",
+                "tool_calls": "tool_use"}.get(finish_reason, "end_turn")
+        yield fm.sse("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop, "stop_sequence": None},
+            "usage": {"output_tokens": int(usage.get("completion_tokens") or 0)}})
         yield fm.sse("message_stop", {"type": "message_stop"})
         chat.store(key, unified, holder.get("final"), stream=True)
         return
@@ -279,12 +274,11 @@ async def _render_stream(endpoint, client, unified, key_info, model, key):
 
     # ---- Responses API ----
     rid = "resp_relayhub"
-    yield fm.sse("response.created", {"type": "response.created", "response": {
-        "id": rid, "object": "response", "created_at": int(time.time()),
-        "status": "in_progress", "model": model, "output": []}})
-    yield fm.sse("response.in_progress", {"type": "response.in_progress", "response": {
-        "id": rid, "object": "response", "created_at": int(time.time()),
-        "status": "in_progress", "model": model, "output": []}})
+    created_at = int(time.time())
+    base_resp = {"id": rid, "object": "response", "created_at": created_at,
+                 "status": "in_progress", "model": model, "output": []}
+    yield fm.sse("response.created", {"type": "response.created", "response": base_resp})
+    yield fm.sse("response.in_progress", {"type": "response.in_progress", "response": base_resp})
     started = False
     try:
         async for ev in chat.stream(client, unified, key_info, endpoint, holder):
@@ -299,7 +293,8 @@ async def _render_stream(endpoint, client, unified, key_info, model, key):
                         yield fm.sse("response.output_item.added", {
                             "type": "response.output_item.added", "output_index": 0,
                             "item": {"id": "msg_relayhub", "type": "message",
-                                     "status": "in_progress", "role": "assistant", "content": []}})
+                                     "status": "in_progress", "role": "assistant",
+                                     "content": []}})
                         yield fm.sse("response.content_part.added", {
                             "type": "response.content_part.added", "item_id": "msg_relayhub",
                             "output_index": 0, "content_index": 0,
@@ -309,8 +304,9 @@ async def _render_stream(endpoint, client, unified, key_info, model, key):
                         "output_index": 0, "content_index": 0, "delta": text})
     except (chat.UpstreamFailed, chat.NoUpstream) as e:
         yield fm.sse("response.failed", {"type": "response.failed", "response": {
-            "id": rid, "object": "response", "status": "failed", "model": model,
-            "output": [], "error": {"code": "upstream_error", "message": str(e)}}})
+            "id": rid, "object": "response", "created_at": created_at,
+            "status": "failed", "model": model, "output": [],
+            "error": {"code": "upstream_error", "message": str(e)}}})
         return
 
     final = holder.get("final") or {}
@@ -318,6 +314,7 @@ async def _render_stream(endpoint, client, unified, key_info, model, key):
     text_part = ""
     if isinstance(final.get("choices"), list) and final["choices"]:
         text_part = (final["choices"][0].get("message") or {}).get("content") or ""
+
     if started:
         yield fm.sse("response.output_text.done", {
             "type": "response.output_text.done", "item_id": "msg_relayhub",
@@ -354,22 +351,23 @@ async def _render_cached_stream(endpoint, unified_resp, model):
             "created": unified_resp.get("created") or int(time.time()),
             "model": unified_resp.get("model") or model,
         }
-        yield fm.sse_data({**base, "choices": [{"index": 0,
-                                                 "delta": {"role": "assistant", "content": ""},
-                                                 "finish_reason": None}]})
+        yield fm.sse_data({**base, "choices": [{
+            "index": 0, "delta": {"role": "assistant", "content": ""},
+            "finish_reason": None}]})
         for piece in fm.split_pieces(text):
-            yield fm.sse_data({**base, "choices": [{"index": 0,
-                                                     "delta": {"content": piece},
-                                                     "finish_reason": None}]})
+            yield fm.sse_data({**base, "choices": [{
+                "index": 0, "delta": {"content": piece}, "finish_reason": None}]})
         for i, tc in enumerate(tool_calls or []):
             fn = tc.get("function") or {}
             yield fm.sse_data({**base, "choices": [{"index": 0, "delta": {"tool_calls": [{
                 "index": i, "id": tc.get("id"), "type": "function",
-                "function": {"name": fn.get("name"), "arguments": fn.get("arguments")}}]},
+                "function": {"name": fn.get("name"),
+                             "arguments": fn.get("arguments")}}]},
                 "finish_reason": None}]})
         choice = fm._first_choice(unified_resp)
-        yield fm.sse_data({**base, "choices": [{"index": 0, "delta": {}, "finish_reason":
-                                                 choice.get("finish_reason") or "stop"}]})
+        yield fm.sse_data({**base, "choices": [{
+            "index": 0, "delta": {},
+            "finish_reason": choice.get("finish_reason") or "stop"}]})
         if unified_resp.get("usage"):
             yield fm.sse_data({**base, "choices": [], "usage": unified_resp["usage"]})
         yield b"data: [DONE]\n\n"
@@ -381,15 +379,17 @@ async def _render_cached_stream(endpoint, unified_resp, model):
             **res, "content": [], "stop_reason": None}})
         yield fm.sse("content_block_start", {"type": "content_block_start", "index": 0,
                                              "content_block": {"type": "text", "text": ""}})
-        text = "".join(b.get("text", "") for b in res["content"] if b.get("type") == "text")
+        text = "".join(b.get("text", "") for b in res["content"]
+                       if b.get("type") == "text")
         for piece in fm.split_pieces(text):
-            yield fm.sse("content_block_delta", {"type": "content_block_delta", "index": 0,
-                                                 "delta": {"type": "text_delta", "text": piece}})
+            yield fm.sse("content_block_delta", {
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": piece}})
         yield fm.sse("content_block_stop", {"type": "content_block_stop", "index": 0})
-        yield fm.sse("message_delta", {"type": "message_delta",
-                                       "delta": {"stop_reason": res["stop_reason"],
-                                                 "stop_sequence": None},
-                                       "usage": {"output_tokens": res["usage"]["output_tokens"]}})
+        yield fm.sse("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": res["stop_reason"], "stop_sequence": None},
+            "usage": {"output_tokens": res["usage"]["output_tokens"]}})
         yield fm.sse("message_stop", {"type": "message_stop"})
         return
 
@@ -401,7 +401,6 @@ async def _render_cached_stream(endpoint, unified_resp, model):
         yield fm.sse_data(fm.openai_to_gemini(unified_resp, model))
         return
 
-    # Responses
     rid = "resp_relayhub"
     full = fm.openai_to_responses(unified_resp, model)
     full["id"] = rid
@@ -420,7 +419,8 @@ async def _render_cached_stream(endpoint, unified_resp, model):
             "output_index": 0, "content_index": 0, "delta": piece})
     yield fm.sse("response.output_text.done", {
         "type": "response.output_text.done", "item_id": "msg_relayhub",
-        "output_index": 0, "content_index": 0, "text": full.get("output_text") or ""})
+        "output_index": 0, "content_index": 0,
+        "text": full.get("output_text") or ""})
     yield fm.sse("response.completed", {"type": "response.completed", "response": full})
 
 
@@ -588,8 +588,9 @@ async def import_config(request: Request, payload: dict = Body(...)):
         note = s.get("note") or ""
         row = db.query_one("SELECT id FROM sites WHERE name=?", (name,))
         if row:
-            db.execute("UPDATE sites SET base_url=?, api_key=?, enabled=?, priority=?, note=? WHERE id=?",
-                       (base_url, api_key, enabled, priority, note, row["id"]))
+            db.execute(
+                "UPDATE sites SET base_url=?, api_key=?, enabled=?, priority=?, note=? WHERE id=?",
+                (base_url, api_key, enabled, priority, note, row["id"]))
             name_to_id[name] = row["id"]
         else:
             cur = db.execute(
@@ -766,7 +767,8 @@ async def import_models(request: Request, payload: dict = Body(...)):
 async def list_routes(request: Request):
     require_admin(request)
     rows = db.query(
-        """SELECT r.*, s.name AS site_name, s.enabled AS site_enabled, s.priority AS site_priority
+        """SELECT r.*, s.name AS site_name, s.enabled AS site_enabled,
+                  s.priority AS site_priority
            FROM routes r JOIN sites s ON s.id = r.site_id
            ORDER BY r.model, s.priority, s.id""")
     out = []
@@ -950,8 +952,8 @@ async def stats(request: Request, days: int = 7):
             "SELECT COALESCE(SUM(count),0) AS c FROM daily_counters WHERE day=? AND site_id=?",
             (engine.today(), d["id"]))
         req = db.query_one(
-            "SELECT COUNT(*) AS n, COALESCE(SUM(ok),0) AS ok FROM request_logs
-             WHERE site_id=? AND ts >= ?", (d["id"], since))
+            """SELECT COUNT(*) AS n, COALESCE(SUM(ok),0) AS ok FROM request_logs
+               WHERE site_id=? AND ts >= ?""", (d["id"], since))
         d["today_total"] = int(c["c"]) if c else 0
         d["period_requests"] = int(req["n"]) if req else 0
         d["period_ok"] = int(req["ok"]) if req else 0
