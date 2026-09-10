@@ -489,20 +489,25 @@ async function resetSite(id) {
 }
 
 async function syncSite(id) {
-  toast('正在拉取模型…');
+  const site = (SITES || []).find(s => s.id === id) || {};
+  const label = site.name || ('站点 #' + id);
+  openSheet('拉取模型 · ' + label, '<div class="empty">正在拉取…</div>', '');
   try {
     const r = await api('/sites/' + id + '/test', { method: 'POST' });
-    if (!r.ok) return toast(r.message, 'err');
-    if (!r.models.length) return toast('该站点没有返回任何模型', 'err');
+    if (!r.ok) {
+      $('#sheet-body').innerHTML = `<div class="empty">拉取失败：${esc(r.message)}</div>`;
+      return;
+    }
     const all = await api('/routes');
-    const have = new Set(all.filter(x => x.site_id === id).map(x => x.model));
-    const picked = r.models.filter(m => !have.has(m));
-    if (!picked.length) return toast(`发现 ${r.models.length} 个模型，全部已导入`, 'ok');
-    if (!confirm(`发现 ${r.models.length} 个模型，其中 ${picked.length} 个尚未导入。\n\n全部导入？`)) return;
-    await api('/models/import', { method: 'POST',
-      body: JSON.stringify({ items: picked.map(m => ({ site_id: id, model: m })) }) });
-    toast(`已导入 ${picked.length} 个模型`, 'ok');
-  } catch (e) { toast(e.message, 'err'); }
+    const existing = all.filter(x => x.site_id === id).map(x => x.model);
+    SCAN_RESULT = [{
+      site_id: id, site_name: label, ok: true, error: "",
+      models: r.models, existing,
+    }];
+    drawScan();
+  } catch (e) {
+    $('#sheet-body').innerHTML = `<div class="empty">拉取失败：${esc(e.message)}</div>`;
+  }
 }
 
 async function quotaSite(id) {
@@ -579,6 +584,33 @@ async function scanAll() {
   drawScan();
 }
 
+function scanPickable() {
+  return $$('#sheet-body .model').filter(lb => {
+    const cb = lb.querySelector('input');
+    return cb && !cb.disabled;
+  });
+}
+
+function updateScanCount() {
+  const picked = scanPickable().filter(lb => lb.querySelector('input').checked).length;
+  const c = $('#scan-count');
+  if (c) c.textContent = picked;
+  const b = $('#scan-import');
+  if (b) { b.disabled = picked === 0; b.textContent = `导入选中的 ${picked} 个`; }
+}
+
+/* 全选 / 全取消；传了 siteId 就只作用于那一个站点分组 */
+function setAllModels(on, siteId) {
+  $$('#sheet-body .model').forEach(lb => {
+    if (siteId !== undefined && String(lb.dataset.site) !== String(siteId)) return;
+    const cb = lb.querySelector('input');
+    if (!cb || cb.disabled) return;
+    cb.checked = on;
+    lb.classList.toggle('on', on);
+  });
+  updateScanCount();
+}
+
 function drawScan() {
   const okList = SCAN_RESULT.filter(r => r.ok);
   const badList = SCAN_RESULT.filter(r => !r.ok);
@@ -591,24 +623,37 @@ function drawScan() {
     const have = new Set(r.existing);
     const chips = r.models.map(m => {
       const done = have.has(m);
-      return `<label class="model ${done ? 'done' : 'on'}" data-site="${r.site_id}" data-model="${esc(m)}">
-        <input type="checkbox" ${done ? 'disabled' : 'checked'} onchange="this.parentNode.classList.toggle('on', this.checked)">
+      return `<label class="model ${done ? 'done' : ''}" data-site="${r.site_id}" data-model="${esc(m)}">
+        <input type="checkbox" ${done ? 'disabled' : ''}
+          onchange="this.parentNode.classList.toggle('on', this.checked); updateScanCount()">
         ${esc(m)}${done ? ' <span class="tag dim">已导入</span>' : ''}</label>`;
     }).join('');
-    return `<div class="site-group"><div class="gh">${esc(r.site_name)}
-      <span class="tag ${r.models.length ? 'acc' : 'dim'}">${r.models.length} 个</span></div>
+    return `<div class="site-group">
+      <div class="gh">${esc(r.site_name)}
+        <span class="tag ${r.models.length ? 'acc' : 'dim'}">${r.models.length} 个</span>
+        <button class="sm" onclick="setAllModels(true, ${r.site_id})">全选</button>
+        <button class="sm" onclick="setAllModels(false, ${r.site_id})">全不选</button></div>
       <div class="models">${chips || '<span class="muted">无</span>'}</div></div>`;
   }).join('');
   const badHtml = badList.map(r => `<div class="site-group"><div class="gh">${esc(r.site_name)}
     <span class="tag err">失败</span></div><div class="note">${esc(r.error)}</div></div>`).join('');
   $('#sheet-body').innerHTML = `
-    <div class="note" style="margin-bottom:16px">共发现 <b>${total}</b> 个模型，其中 <b>${fresh}</b> 个尚未导入。已导入的会置灰跳过。</div>
+    <div class="note" style="margin-bottom:14px">
+      共发现 <b>${total}</b> 个模型，其中 <b>${fresh}</b> 个尚未导入。
+      下面<b>按站点分组</b>，<b>默认全部不勾选</b>，自己挑。已导入的会置灰。
+      <div class="gap">
+        <button class="sm" onclick="setAllModels(true)">全部全选</button>
+        <button class="sm" onclick="setAllModels(false)">全部取消</button>
+      </div>
+    </div>
     ${groups || '<div class="empty">没有可用的站点</div>'}
     ${badHtml ? '<hr>' + badHtml : ''}`;
   $('#sheet-foot').innerHTML = `<span class="muted">默认每日上限</span>
-    <input id="imp-limit" type="number" value="0" style="width:110px">
+    <input id="imp-limit" type="number" value="0" style="width:100px">
+    <span class="muted">已选 <b id="scan-count">0</b> 个</span>
     <button onclick="closeSheet()">取消</button>
-    <button class="primary" onclick="importScan()" ${fresh ? '' : 'disabled'}>导入选中的 ${fresh} 个</button>`;
+    <button class="primary" id="scan-import" onclick="importScan()" disabled>导入选中的 0 个</button>`;
+  updateScanCount();
 }
 
 async function importScan() {
@@ -623,7 +668,9 @@ async function importScan() {
   try {
     const r = await api('/models/import', { method: 'POST', body: JSON.stringify({ items, daily_limit: limit }) });
     toast(`已导入 ${r.added} 个模型`, 'ok');
-    closeSheet(); RENDER.models();
+    closeSheet();
+    const tab = $('nav.tabs button.active');
+    (RENDER[tab ? tab.dataset.tab : 'models'] || (() => {}))();
   } catch (e) { toast(e.message, 'err'); }
 }
 
