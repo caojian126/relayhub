@@ -518,7 +518,15 @@ async def admin_login(payload: dict = Body(...)):
 
 @app.get("/admin/api/me")
 async def admin_me(request: Request):
-    return {"username": require_admin(request)}
+    """当前面板账号名。
+
+    注意这里要读数据库，不能直接回令牌里的用户名：
+    用户在「设置」页改了账号名之后，手里的令牌还是旧的，
+    如果回令牌里的值，右上角就会一直显示改名前的名字，直到重新登录。
+    """
+    require_admin(request)
+    row = db.query_one("SELECT username FROM admins ORDER BY id LIMIT 1")
+    return {"username": row["username"] if row else ""}
 
 
 @app.get("/admin/api/account")

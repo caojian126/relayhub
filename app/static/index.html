@@ -945,6 +945,7 @@ RENDER.settings = async function () {
   try {
     const s = await api('/settings');
     const acc = await api('/account');
+    $('#who').textContent = acc.username || $('#who').textContent;
     const cs = await api('/cache');
     const pwEnv = !!acc.password_from_env;
     const userEnv = !!acc.username_from_env;
@@ -1102,6 +1103,8 @@ async function saveAccount() {
   };
   try {
     await api('/account', { method: 'PUT', body: JSON.stringify(payload) });
+    // 账号名可能刚被改掉，立刻把右上角同步过来（别等重新登录）
+    try { $('#who').textContent = (await api('/me')).username; } catch (e2) { /* 忽略 */ }
     toast('已保存', 'ok'); RENDER.settings();
   } catch (e) { toast(e.message, 'err'); }
 }

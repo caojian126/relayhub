@@ -427,6 +427,16 @@ def main():
     check("不含统一模型的节点（auto / batch1）",
           "auto" not in names and "batch1" not in names, sorted(names))
 
+    print("\n=== 17. 改面板账号名后 /me 要立刻跟着变 ===", flush=True)
+    st, r = admin("/account", "PUT", {"username": "测试账号"})
+    check("修改面板账号名", st == 200, r)
+    st, me = admin("/me")
+    check("/me 返回数据库里的新名字（不是令牌里的旧名）",
+          st == 200 and me.get("username") == "测试账号", me)
+    st, r = admin("/account", "PUT", {"username": "admin"})
+    st, me = admin("/me")
+    check("改回 admin 同样生效", st == 200 and me.get("username") == "admin", me)
+
     print("\n" + "=" * 56, flush=True)
     if FAILED:
         print(f"结果：{len(FAILED)} 项失败", flush=True)
