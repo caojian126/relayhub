@@ -6,6 +6,7 @@
 覆盖：站点 / 拉模型 / 统一模型 / 节点排序 / 网关 Key /
       普通请求 / 流式请求 / 故障切换 / 不可重试错误 / 流式断流 /
       /v1/models 只露统一模型 / 导出安全与完整 / 导入合并与覆盖
+      调度台：站点顺序 + 整站每日总次数
 """
 
 import json
@@ -436,6 +437,92 @@ def main():
     st, r = admin("/account", "PUT", {"username": "admin"})
     st, me = admin("/me")
     check("改回 admin 同样生效", st == 200 and me.get("username") == "admin", me)
+
+    print("\n=== 18. 调度台：站点顺序 + 整站每日总次数 ===", flush=True)
+
+    st, sch = admin("/schedule")
+    check("调度台返回站点列表", st == 200 and isinstance(sch, list) and len(sch) >= 1,
+          len(sch) if st == 200 else st)
+    check("调度台带 rank / today_total / daily_limit",
+          bool(sch) and all(k in sch[0] for k in ("rank", "today_total", "daily_limit")),
+          sorted(sch[0].keys()) if sch else None)
+    check("调度台不泄露 api_key", all("api_key" not in s for s in sch))
+    check("rank 从 1 连续编号",
+          [s["rank"] for s in sch] == list(range(1, len(sch) + 1)),
+          [s["rank"] for s in sch])
+
+    # 临时加一个站，好验证「两个站拖动换位」
+    origin = {s["id"]: s["priority"] for s in sch}
+    st, r = admin("/sites", "POST",
+                  {"name": "调度副本", "base_url": MOCK_B, "api_key": "sk-mock-key-123456"})
+    check("新增临时站点用于排序", st == 200 and r.get("id"), r)
+    temp_id = r.get("id")
+
+    st, sch = admin("/schedule")
+    order = [s["id"] for s in sch]
+    check("默认按 priority 升序排", order == [s["id"] for s in sorted(sch, key=lambda x: x["priority"])],
+          [(s["name"], s["priority"]) for s in sch])
+
+    flipped = list(reversed(order))
+    st, r = admin("/schedule/order", "POST", {"ids": flipped})
+    check("提交站点顺序", st == 200 and r.get("updated") == len(flipped), r)
+    st, sch2 = admin("/schedule")
+    check("拖动后顺序真的落库", [s["id"] for s in sch2] == flipped,
+          [(s["name"], s["rank"]) for s in sch2])
+    check("换位后 rank 跟着重排", [s["rank"] for s in sch2] == list(range(1, len(sch2) + 1)),
+          [s["rank"] for s in sch2])
+
+    admin("/schedule/order", "POST", {"ids": order})
+    st, sch3 = admin("/schedule")
+    check("顺序可还原", [s["id"] for s in sch3] == order, [s["name"] for s in sch3])
+
+    # ---- 整站每日总次数：真的会挡住请求
+    admin("/groups", "POST", {"name": "qcap", "strategy": "priority"})
+    st, r = admin("/groups/qcap/nodes", "POST",
+                  {"site_id": site_id_of("A站"), "upstream_model": "gpt-5-mini"})
+    check("建 1 个节点用于配额测试", st == 200, r)
+
+    st, kr = admin("/keys", "POST", {"name": "sched", "daily_limit": 0})
+    skey = kr.get("key") or KEY
+    r = gw("/chat/completions", "POST",
+           {"model": "qcap", "messages": [{"role": "user", "content": "配额·预热-1"}]}, key=skey)
+    check("配额测试前请求正常", r.status_code == 200, r.status_code)
+
+    st, sch = admin("/schedule")
+    arow = [s for s in sch if s["name"] == "A站"][0]
+    used = arow["today_total"]
+    check("A站今日用量已累计", used >= 1, used)
+
+    st, r = admin("/schedule/limits", "POST", {"items": [{"id": arow["id"], "daily_limit": used}]})
+    check("把整站上限设成「已用量」", st == 200 and r.get("updated") == 1, r)
+    st, sch = admin("/schedule")
+    check("上限已落库", [s for s in sch if s["name"] == "A站"][0]["daily_limit"] == used)
+    r = gw("/chat/completions", "POST",
+           {"model": "qcap", "messages": [{"role": "user", "content": "配额·应被挡-2"}]}, key=skey)
+    check("整站总次数用满后请求被挡（503）", r.status_code == 503, r.status_code)
+
+    admin("/schedule/limits", "POST", {"items": [{"id": arow["id"], "daily_limit": used + 100}]})
+    r = gw("/chat/completions", "POST",
+           {"model": "qcap", "messages": [{"role": "user", "content": "配额·放宽后-3"}]}, key=skey)
+    check("放宽上限后又能用了", r.status_code == 200, r.status_code)
+
+    admin("/schedule/limits", "POST", {"items": [{"id": arow["id"], "daily_limit": 0}]})
+    st, sch = admin("/schedule")
+    check("上限设 0 后回读是 0（0 = 不限）",
+          [s for s in sch if s["name"] == "A站"][0]["daily_limit"] == 0)
+    r = gw("/chat/completions", "POST",
+           {"model": "qcap", "messages": [{"role": "user", "content": "配额·不限-4"}]}, key=skey)
+    check("不限时照常可用", r.status_code == 200, r.status_code)
+
+    # 收尾：清掉临时数据，别影响后面的持久化校验
+    admin("/groups/qcap?nodes=1", "DELETE")
+    admin(f"/sites/{temp_id}", "DELETE")
+    for sid, pri in origin.items():
+        admin(f"/sites/{sid}", "PUT", {"priority": pri})
+    st, sch = admin("/schedule")
+    check("清掉临时站后只剩 A 站", st == 200 and [s["name"] for s in sch] == ["A站"],
+          [s["name"] for s in sch] if st == 200 else st)
+    check("没设过上限的站默认按不限处理", all(s["daily_limit"] == 0 for s in sch))
 
     print("\n" + "=" * 56, flush=True)
     if FAILED:

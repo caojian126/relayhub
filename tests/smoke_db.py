@@ -8,6 +8,7 @@ request_logs 没有 switches/stream_phase），然后用当前代码执行 init_
   2. 站点 / API Key / 路由 / 上游模型名 一条不丢
   3. 旧的 routes.model 自动补齐成统一模型记录，并且能区分
      「手工建的统一模型」和「导入模型时自动生成的分组」
+  4. sites.daily_limit（整站每日总上限）补列，默认 0 = 不限
 
 用法： python3 tests/smoke_db.py
 """
@@ -73,9 +74,13 @@ lcols = {r["name"] for r in db.query("PRAGMA table_info(request_logs)")}
 assert {"cached", "endpoint", "switches", "stream_phase"} <= lcols, \
     f"request_logs 缺列: {sorted(lcols)}"
 
+scols = {r["name"] for r in db.query("PRAGMA table_info(sites)")}
+assert "daily_limit" in scols, f"sites 缺列: {sorted(scols)}"
+
 # 2. 数据不丢
 sites = db.query("SELECT * FROM sites")
 assert len(sites) == 1 and sites[0]["api_key"] == "sk-aaaa-secret", "站点或 Key 丢了"
+assert sites[0]["daily_limit"] == 0, "新增的整站每日上限默认值应为 0（不限）"
 
 routes = db.query("SELECT * FROM routes ORDER BY id")
 assert len(routes) == 2, f"路由条数变成 {len(routes)}"

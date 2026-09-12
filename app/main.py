@@ -1074,6 +1074,75 @@ async def reorder_nodes(name: str, request: Request, payload: dict = Body(...)):
     return {"ok": True, "updated": n}
 
 
+# -------- 调度台（站点顺序 + 整站每日总次数）
+
+def _site_schedule_rows():
+    """调度台用的站点列表。故意不 SELECT *，免得把 api_key 带出去。"""
+    rows = db.query(
+        """SELECT id, name, enabled, priority, note, daily_limit,
+                  circuit_until, fail_streak, last_error,
+                  quota_known, quota_remaining, quota_checked_at, created_at
+           FROM sites ORDER BY priority, id"""
+    )
+    now = time.time()
+    out = []
+    for i, row in enumerate(rows):
+        d = db.rowdict(row)
+        c = db.query_one(
+            "SELECT COALESCE(SUM(count),0) AS c FROM daily_counters WHERE day=? AND site_id=?",
+            (engine.today(), d["id"]))
+        d["today_total"] = int(c["c"]) if c else 0
+        d["daily_limit"] = int(d.get("daily_limit") or 0)
+        d["rank"] = i + 1
+        d["circuit_active"] = bool(d["circuit_until"] and d["circuit_until"] > now)
+        out.append(d)
+    return out
+
+
+@app.get("/admin/api/schedule")
+async def get_schedule(request: Request):
+    require_admin(request)
+    return _site_schedule_rows()
+
+
+@app.post("/admin/api/schedule/order")
+async def reorder_sites(request: Request, payload: dict = Body(...)):
+    """拖拽排序后提交。ids 是从上到下的站点 id 顺序。
+
+    写进 sites.priority（10/20/30...）。站点列表、候选排序的兜底名次都按它走。
+    """
+    require_admin(request)
+    ids = payload.get("ids") or []
+    n = 0
+    for i, site_id in enumerate(ids):
+        try:
+            site_id = int(site_id)
+        except (TypeError, ValueError):
+            continue
+        db.execute("UPDATE sites SET priority=? WHERE id=?", (10 + i * 10, site_id))
+        n += 1
+    return {"ok": True, "updated": n}
+
+
+@app.post("/admin/api/schedule/limits")
+async def set_site_limits(request: Request, payload: dict = Body(...)):
+    """批量设置「整站每天总次数」。0 或留空 = 不限。"""
+    require_admin(request)
+    items = payload.get("items") or []
+    n = 0
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        try:
+            site_id = int(it.get("id"))
+            limit = int(it.get("daily_limit") or 0)
+        except (TypeError, ValueError):
+            continue
+        db.execute("UPDATE sites SET daily_limit=? WHERE id=?", (max(0, limit), site_id))
+        n += 1
+    return {"ok": True, "updated": n}
+
+
 # -------- 站点
 
 @app.get("/admin/api/sites")
@@ -1128,6 +1197,9 @@ async def update_site(site_id: int, request: Request, payload: dict = Body(...))
     if "priority" in payload and payload["priority"] is not None:
         fields.append("priority=?")
         values.append(int(payload["priority"]))
+    if "daily_limit" in payload and payload["daily_limit"] is not None:
+        fields.append("daily_limit=?")
+        values.append(max(0, int(payload["daily_limit"] or 0)))
     if "enabled" in payload:
         fields.append("enabled=?")
         values.append(1 if payload["enabled"] else 0)

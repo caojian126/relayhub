@@ -48,7 +48,7 @@ def get_candidates(model):
                s.priority        AS site_priority,
                s.fail_streak     AS site_fail_streak,
                s.circuit_until   AS site_circuit_until,
-               s.quota_known, s.quota_remaining,
+               s.quota_known, s.quota_remaining, s.daily_limit AS site_daily_limit,
                r.id AS route_id, r.model, r.upstream_model, r.daily_limit,
                r.priority        AS node_priority,
                r.fail_streak     AS node_fail_streak,
@@ -75,6 +75,16 @@ def get_candidates(model):
         used = get_today_count(c["site_id"], model)
         if limit and used >= limit:
             continue
+        # 站点级「每天总共能用几次」：跨该站所有统一模型累加。0 = 不限。
+        # 跟上面的 limit 是两回事：limit 管「某站×某模型」，这里管整站。
+        site_limit = c["site_daily_limit"] or 0
+        if site_limit:
+            t = db.query_one(
+                "SELECT COALESCE(SUM(count),0) AS c FROM daily_counters WHERE day=? AND site_id=?",
+                (today(), c["site_id"]),
+            )
+            if (int(t["c"]) if t else 0) >= site_limit:
+                continue
         c["today_count"] = used
         c["priority"] = c["node_priority"] if c["node_priority"] is not None else 100
         out.append(c)

@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS sites (
   api_key           TEXT    NOT NULL DEFAULT '',
   enabled           INTEGER NOT NULL DEFAULT 1,
   priority          INTEGER NOT NULL DEFAULT 100,
+  daily_limit       INTEGER NOT NULL DEFAULT 0,
   note              TEXT    NOT NULL DEFAULT '',
   fail_streak       INTEGER NOT NULL DEFAULT 0,
   circuit_until     REAL    NOT NULL DEFAULT 0,
@@ -164,6 +165,10 @@ DEFAULT_SETTINGS = {
 
 # 建表后需要补充的列（兼容旧数据库）
 MIGRATIONS = {
+    "sites": {
+        # 「一个站一天总共能用几次」：跨该站所有统一模型累加。0 = 不限。
+        "daily_limit": "INTEGER NOT NULL DEFAULT 0",
+    },
     "request_logs": {
         "cached": "INTEGER NOT NULL DEFAULT 0",
         "endpoint": "TEXT NOT NULL DEFAULT 'openai'",
