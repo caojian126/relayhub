@@ -559,7 +559,7 @@ def main():
     check("清掉额度测试站后只剩 A 站", st == 200 and [s["name"] for s in sites] == ["A站"],
           [s["name"] for s in sites] if st == 200 else st)
 
-    print("\n=== 20. 「顺序」页排的站序真的决定走哪个站 ===", flush=True)
+    print("\n=== 20. 全局站序真的决定走哪个站；统一模型可单独覆盖 ===", flush=True)
 
     # 只改 sites.priority，不动任何节点 —— 如果引擎里节点优先级压过站点优先级，
     # 这里就会失败，「顺序」页也就是个摆设。
@@ -588,6 +588,26 @@ def main():
     r = ask("站序测试-2")
     check("站序：序B 排前面时就走 8102",
           r.status_code == 200 and "8102" in r.text, r.text[:160])
+
+    # 在统一模型里单独拖过顺序 → 这个模型改听自己的，压过全局站序
+    admin("/schedule/order", "POST", {"ids": [sids["序A"], sids["序B"]]})  # 全局：序A 先
+    _, nds = admin("/groups/sorder/nodes")
+    byname = {n["site_name"]: n["id"] for n in nds}
+    admin("/groups/sorder/order", "POST", {"ids": [byname["序B"], byname["序A"]]})
+    _, gs = admin("/groups")
+    grp = [g for g in gs if g["name"] == "sorder"][0]
+    check("在统一模型里拖过后标记 ordered=1", grp.get("ordered") == 1, grp.get("ordered"))
+    r = ask("站序测试-3")
+    check("ordered=1 时听自己的节点序（走 8102）",
+          r.status_code == 200 and "8102" in r.text, r.text[:160])
+
+    admin("/groups/sorder/order", "POST", {"follow_global": 1})
+    _, gs = admin("/groups")
+    grp = [g for g in gs if g["name"] == "sorder"][0]
+    check("恢复跟随后标记 ordered=0", grp.get("ordered") == 0, grp.get("ordered"))
+    r = ask("站序测试-4")
+    check("恢复跟随后又听全局站序（序A 排前面 → 走 8101）",
+          r.status_code == 200 and "8101" in r.text, r.text[:160])
 
     admin("/groups/sorder?nodes=1", "DELETE")
     for nm in ("序A", "序B"):

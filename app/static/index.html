@@ -1189,7 +1189,9 @@ function groupRow(g) {
     <td>${live}${g.enabled ? '' : ' <span class="tag dim">已停用</span>'}${
       g.is_public ? ' <span class="tag acc">对外可见</span>' : ' <span class="tag dim">仅内部</span>'}</td>
     <td>${g.nodes}</td>
-    <td class="mono">${esc(g.strategy || '继承全局')}</td>
+    <td class="mono">${esc(g.strategy || '继承全局')}<br>${
+      g.ordered ? '<span class="tag warn">自己一套顺序</span>'
+                : '<span class="tag dim">跟随全局站序</span>'}</td>
     <td class="muted" style="max-width:150px">${esc(g.note || '')}</td>
     <td class="nowrap">
       <button class="sm primary" onclick="openGroup('${jsq(g.name)}')">管理节点</button>
@@ -1419,10 +1421,15 @@ async function drawGroupSheet() {
         <button class="sm danger" onclick="delNode(${n.id})">移除</button>
       </td></tr>`).join('');
 
+  const ordered = !!(g && g.ordered);
+  const orderNote = ordered
+    ? `当前：<b>这个模型自己一套顺序</b>（你在下面拖过），不跟随「顺序」页的全局站序。
+       <button class="sm" onclick="followGlobalOrder()">恢复跟随全局站序</button>`
+    : `当前：<b>跟随「顺序」页排的全局站序</b>。在下面拖一下，就会改成「这个模型自己一套」。`;
   openSheet('统一模型 ' + CUR_GROUP + (g ? `（${esc(g.strategy || '继承全局')}）` : ''), `
     <div class="note" style="margin-bottom:14px">
-      节点顺序就是尝试顺序。按住左边的 <b>≡</b> 上下拖动，松手立刻保存生效。
-      ${g && g.strategy === 'priority' ? '<b>当前按节点顺序走：请求严格按下面这个顺序。</b>' : ''}
+      按住左边的 <b>≡</b> 上下拖动，可以单独排这个模型的顺序，松手立刻保存。<br>
+      ${orderNote}
       ${g && !g.is_public ? '<br>该统一模型标记为「仅内部」，不会出现在 /v1/models 里。' : ''}
     </div>
     <div class="scroll"><table>
@@ -1665,6 +1672,16 @@ function initDrag(tbody) {
       if (dragging) { dragging = null; commitOrder(tbody); }
     };
   });
+}
+
+async function followGlobalOrder() {
+  if (!CUR_GROUP) return;
+  try {
+    await api('/groups/' + encodeURIComponent(CUR_GROUP) + '/order',
+      { method: 'POST', body: JSON.stringify({ follow_global: 1 }) });
+    toast('已恢复跟随全局站序', 'ok');
+    await drawGroupSheet(); RENDER.groups();
+  } catch (e) { toast(e.message, 'err'); }
 }
 
 async function commitOrder(tbody) {
