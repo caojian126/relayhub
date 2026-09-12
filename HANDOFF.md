@@ -147,7 +147,7 @@ token 需要 `Contents: Read and write`（细粒度）或 `repo`（经典）。*
 
 | # | 事项 | 说明 |
 |---|---|---|
-| 1 | **浏览器交互没实测过** | 沙箱没浏览器。拖拽排序、聊天测试区只做了 JS 语法解析 + `onclick` 函数存在性检查。端点行为是测过的 |
+| 1 | **浏览器交互没实测过** | 沙箱没浏览器。拖拽排序、聊天测试区只做到了 `tests/js_check.py`（esprima 真解析 + 内联函数存在性检查）。端点行为都是测过的。**新加的「顺序」页拖拽同样没在真浏览器里点过**（只让 `≡` 可拖、并补了 Firefox 必需的 `dataTransfer.setData`） |
 | 2 | **Zeabur 持久卷无法本地模拟** | 挂载点检测逻辑（`config.data_dir_is_mount`）本身有测试，真实 Volume 没验过 |
 | 3 | 同站多模型进同一组 | 需要放开 `UNIQUE(site_id, model)` → 改成三列唯一。注意同步改 `models_sync.import_models` 和 `create_route` 里的 `ON CONFLICT` 目标 |
 | 4 | 概览页每次刷新查一次 `cache.stats()` | 站点多时略慢，可合并成一次查询 |
