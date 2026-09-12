@@ -559,6 +559,41 @@ def main():
     check("清掉额度测试站后只剩 A 站", st == 200 and [s["name"] for s in sites] == ["A站"],
           [s["name"] for s in sites] if st == 200 else st)
 
+    print("\n=== 20. 「顺序」页排的站序真的决定走哪个站 ===", flush=True)
+
+    # 只改 sites.priority，不动任何节点 —— 如果引擎里节点优先级压过站点优先级，
+    # 这里就会失败，「顺序」页也就是个摆设。
+    sids = {}
+    for nm, url in (("序A", MOCK_A), ("序B", MOCK_B)):
+        st, r = admin("/sites", "POST",
+                      {"name": nm, "base_url": url, "api_key": "sk-mock-key-123456"})
+        sids[nm] = r.get("id")
+    admin("/groups", "POST", {"name": "sorder", "strategy": "priority"})
+    for nm in ("序A", "序B"):
+        admin("/groups/sorder/nodes", "POST",
+              {"site_id": sids[nm], "upstream_model": "gpt-5"})
+    st, kr = admin("/keys", "POST", {"name": "sorder", "daily_limit": 0})
+    skey = kr.get("key") or skey
+
+    def ask(tag):
+        return gw("/chat/completions", "POST",
+                  {"model": "sorder", "messages": [{"role": "user", "content": tag}]}, key=skey)
+
+    admin("/schedule/order", "POST", {"ids": [sids["序A"], sids["序B"]]})
+    r = ask("站序测试-1")
+    check("站序：序A 排前面时就走 8101",
+          r.status_code == 200 and "8101" in r.text, r.text[:160])
+
+    admin("/schedule/order", "POST", {"ids": [sids["序B"], sids["序A"]]})
+    r = ask("站序测试-2")
+    check("站序：序B 排前面时就走 8102",
+          r.status_code == 200 and "8102" in r.text, r.text[:160])
+
+    admin("/groups/sorder?nodes=1", "DELETE")
+    for nm in ("序A", "序B"):
+        admin(f"/sites/{sids[nm]}", "DELETE")
+
+
     print("\n" + "=" * 56, flush=True)
     if FAILED:
         print(f"结果：{len(FAILED)} 项失败", flush=True)

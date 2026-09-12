@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS model_groups (
   strategy    TEXT    NOT NULL DEFAULT '',
   note        TEXT    NOT NULL DEFAULT '',
   created_at  REAL    NOT NULL DEFAULT 0,
-  auto        INTEGER NOT NULL DEFAULT 0
+  auto        INTEGER NOT NULL DEFAULT 0,
+  ordered     INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS routes (
@@ -194,6 +195,9 @@ MIGRATIONS = {
     },
     "model_groups": {
         "auto": "INTEGER NOT NULL DEFAULT 0",
+        # 是否在「统一模型」页里手工拖过节点顺序。
+        # 拖过 = 这个模型听自己的 routes.priority；没拖过 = 跟随「顺序」页的全局站序。
+        "ordered": "INTEGER NOT NULL DEFAULT 0",
     },
 }
 

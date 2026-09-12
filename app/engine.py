@@ -49,6 +49,7 @@ def get_candidates(model):
                s.fail_streak     AS site_fail_streak,
                s.circuit_until   AS site_circuit_until,
                s.quota_known, s.quota_remaining, s.daily_limit AS site_daily_limit,
+               COALESCE(g.ordered, 0) AS group_ordered,
                r.id AS route_id, r.model, r.upstream_model, r.daily_limit,
                r.priority        AS node_priority,
                r.fail_streak     AS node_fail_streak,
@@ -92,17 +93,35 @@ def get_candidates(model):
 
 
 def sort_candidates(cands, strategy):
-    """节点排序。c["priority"] 是「站点×模型」节点的排序号（越小越优先）。"""
+    """节点排序。两层语义：
+
+      * 默认按「顺序」页排的**全局站序**（`sites.priority`）走；
+      * 如果这个统一模型在「统一模型」页里单独拖过节点（`model_groups.ordered=1`），
+        就听它自己的节点顺序（`routes.priority`）。
+
+    老库升级后所有模型都是 ordered=0，而各站 sites.priority 都是默认的 100，
+    于是并列 → 退回按节点顺序排，行为跟以前完全一致，不会因为升级就乱序。
+    """
+    pinned = bool(cands and cands[0].get("group_ordered"))
+
     if strategy == "priority":
-        cands.sort(key=lambda c: (c["priority"], c["site_priority"], c["today_count"]))
+        if pinned:
+            cands.sort(key=lambda c: (c["priority"], c["site_priority"], c["today_count"]))
+        else:
+            cands.sort(key=lambda c: (c["site_priority"], c["priority"], c["today_count"]))
     elif strategy == "round_robin":
-        cands.sort(key=lambda c: (c["today_count"], c["priority"], c["site_priority"]))
+        if pinned:
+            cands.sort(key=lambda c: (c["today_count"], c["priority"], c["site_priority"]))
+        else:
+            cands.sort(key=lambda c: (c["today_count"], c["site_priority"], c["priority"]))
     else:
         def key(c):
             known = 1 if (c["quota_known"] and c["quota_remaining"] is not None) else 0
             rem = c["quota_remaining"] if known else 0
-            # 先排「额度已知」的（余额多优先），再排额度未知的（按节点顺序）
-            return (0 if known else 1, -rem, c["priority"], c["site_priority"], c["today_count"])
+            first, second = ((c["priority"], c["site_priority"]) if pinned
+                             else (c["site_priority"], c["priority"]))
+            # 先排「额度已知」的（余额多优先），再排额度未知的
+            return (0 if known else 1, -rem, first, second, c["today_count"])
         cands.sort(key=key)
     return cands
 

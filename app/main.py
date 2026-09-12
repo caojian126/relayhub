@@ -843,6 +843,9 @@ async def list_groups(request: Request):
         # auto=1 表示「跟着导入的模型自动生成的」，不是用户手工建的。
         # 前端默认把它折叠起来，免得被几百个模型名刷屏。
         g["auto"] = int(g.get("auto") or 0)
+        # ordered=1 表示这个模型在「统一模型」页里单独拖过节点顺序，
+        # 也就是它不再跟随「顺序」页的全局站序。
+        g["ordered"] = int(g.get("ordered") or 0)
         out.append(g)
     return out
 
@@ -1055,12 +1058,17 @@ async def reset_node_ep(node_id: int, request: Request):
 
 @app.post("/admin/api/groups/{name}/order")
 async def reorder_nodes(name: str, request: Request, payload: dict = Body(...)):
-    """拖拽排序后提交。ids 就是从上到下的节点 id 顺序。
+    """统一模型里的节点顺序。两种用法：
 
-    写进 routes.priority（10/20/30...），priority 策略与 balanced 策略的
-    并列名次都按它排，所以拖完立刻生效。
+      * {"ids": [...]}        拖拽后提交，写进 routes.priority（10/20/30...），
+                              并把该模型标记 ordered=1 —— 从此这个模型不再跟随
+                              「顺序」页的全局站序，听自己的。
+      * {"follow_global": 1}  撤销，恢复跟随全局站序（ordered=0）。
     """
     require_admin(request)
+    if payload.get("follow_global") or payload.get("reset"):
+        db.execute("UPDATE model_groups SET ordered=0 WHERE name=?", (name,))
+        return {"ok": True, "updated": 0, "follow_global": True}
     ids = payload.get("ids") or []
     n = 0
     for i, node_id in enumerate(ids):
@@ -1071,7 +1079,8 @@ async def reorder_nodes(name: str, request: Request, payload: dict = Body(...)):
         db.execute("UPDATE routes SET priority=? WHERE id=? AND model=?",
                    (10 + i * 10, node_id, name))
         n += 1
-    return {"ok": True, "updated": n}
+    db.execute("UPDATE model_groups SET ordered=1 WHERE name=?", (name,))
+    return {"ok": True, "updated": n, "follow_global": False}
 
 
 # -------- 调度台（站点顺序 + 整站每日总次数）
