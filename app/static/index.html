@@ -192,6 +192,8 @@ footer b{color:var(--ink-2)}
 .schedbar{height:7px;border-radius:999px;background:rgba(139,144,168,.18);overflow:hidden;margin-top:6px;min-width:90px}
 .schedbar>i{display:block;height:100%;border-radius:999px;background:var(--grad)}
 .schedbar.over>i{background:linear-gradient(135deg,#e05560,#c93a44)}
+.raw{white-space:pre-wrap;word-break:break-all;font-size:11.5px;line-height:1.55;max-height:300px;overflow:auto;
+  padding:10px 12px;border-radius:10px;background:rgba(20,18,30,.05);border:1px solid rgba(120,110,150,.18);margin-top:6px}
 .chat-box{display:flex;flex-direction:column;gap:12px;min-height:200px;max-height:50vh;overflow-y:auto;padding:4px 2px}
 .msg{max-width:80%;padding:11px 15px;border-radius:16px;font-size:13.5px;line-height:1.7;
   white-space:pre-wrap;word-break:break-word}
@@ -406,9 +408,10 @@ RENDER.sites = async function () {
     const rows = SITES.map(s => {
       const st = !s.enabled ? '<span class="tag dim">停用</span>'
         : s.circuit_active ? '<span class="tag err">熔断</span>' : '<span class="tag ok">正常</span>';
-      const q = s.quota_known
+      const q = (s.quota_known
         ? (s.quota_remaining != null ? s.quota_remaining.toFixed(2) : '<span class="muted">仅已用</span>')
-        : '<span class="muted">未知</span>';
+        : '<span class="muted">未知</span>')
+        + (s.quota_note ? ` <span class="tag warn" title="${esc(s.quota_note)}">?</span>` : '');
       return `<tr>
         <td><b>${esc(s.name)}</b>${s.note ? `<br><span class="muted">${esc(s.note)}</span>` : ''}</td>
         <td class="mono">${esc(s.base_url)}</td>
@@ -520,8 +523,18 @@ async function quotaSite(id) {
   toast('查询中…');
   try {
     const r = await api('/sites/' + id + '/quota', { method: 'POST' });
-    if (r.known) toast('剩余：' + (r.remaining != null ? r.remaining : '?') + ' / 上限 ' + (r.limit != null ? r.limit : '?'));
-    else toast('查不到额度：' + (r.error || '接口不支持'), 'err');
+    const s = SITES.find(x => x.id === id) || {};
+    const fmt = v => (v === null || v === undefined ? '—' : v);
+    const rows = [['上限', fmt(r.limit)], ['已用', fmt(r.used)], ['剩余', fmt(r.remaining)],
+      ['取值字段', r.source || '—'], ['说明', r.note || '—'], ['错误', r.error || '—']]
+      .map(([k, v]) => `<tr><th style="width:96px">${k}</th><td>${esc(String(v))}</td></tr>`).join('');
+    openSheet('额度查询 · ' + (s.name || ('#' + id)),
+      `<div class="note">各站的字段单位并不统一，而且很多站把「不限」写成一个大数占位。
+         数字对不上时，直接看下面的原始返回最快。</div>
+       <table style="margin-top:10px">${rows}</table>
+       <div class="note" style="margin-top:12px">站点原始返回（最多 4000 字）</div>
+       <pre class="raw">${esc(r.raw || '(空)')}</pre>`,
+      '<button class="sm" onclick="closeSheet()">关闭</button>');
     RENDER.sites();
   } catch (e) { toast(e.message, 'err'); }
 }
@@ -1300,10 +1313,10 @@ function newGroup() {
       <div><label>显示名（可空）</label><input id="g-display" placeholder="自动选择"></div>
     </div>
     <div class="row gap">
-      <div><label>策略</label><select id="g-strategy">
-        <option value="">继承全局设置</option>
-        <option value="priority">priority — 严格按节点顺序</option>
-        <option value="balanced">balanced — 按剩余额度加权</option>
+      <div><label>这个模型的调度方式</label><select id="g-strategy">
+        <option value="">跟全局走（在「顺序」页设置）</option>
+        <option value="priority">按下面的节点顺序</option>
+        <option value="balanced">谁剩余额度多用谁</option>
         <option value="round_robin">round_robin — 轮流</option></select></div>
       <div><label>对外可见</label><select id="g-public">
         <option value="1">是（出现在 /v1/models）</option>
@@ -1340,10 +1353,10 @@ async function editGroup(name) {
       <div><label>显示名</label><input id="ge-display" value="${esc(g.display || '')}"></div>
     </div>
     <div class="row gap">
-      <div><label>策略</label><select id="ge-strategy">
-        <option value="" ${sel('')}>继承全局设置</option>
-        <option value="priority" ${sel('priority')}>priority — 严格按节点顺序</option>
-        <option value="balanced" ${sel('balanced')}>balanced — 按剩余额度加权</option>
+      <div><label>这个模型的调度方式</label><select id="ge-strategy">
+        <option value="" ${sel('')}>跟全局走（在「顺序」页设置）</option>
+        <option value="priority" ${sel('priority')}>按下面的节点顺序</option>
+        <option value="balanced" ${sel('balanced')}>谁剩余额度多用谁</option>
         <option value="round_robin" ${sel('round_robin')}>round_robin — 轮流</option></select></div>
       <div><label>启用</label><select id="ge-enabled">
         <option value="1" ${g.enabled ? 'selected' : ''}>启用</option>
@@ -1409,7 +1422,7 @@ async function drawGroupSheet() {
   openSheet('统一模型 ' + CUR_GROUP + (g ? `（${esc(g.strategy || '继承全局')}）` : ''), `
     <div class="note" style="margin-bottom:14px">
       节点顺序就是尝试顺序。按住左边的 <b>≡</b> 上下拖动，松手立刻保存生效。
-      ${g && g.strategy === 'priority' ? '<b>当前策略 priority：请求严格按这个顺序走。</b>' : ''}
+      ${g && g.strategy === 'priority' ? '<b>当前按节点顺序走：请求严格按下面这个顺序。</b>' : ''}
       ${g && !g.is_public ? '<br>该统一模型标记为「仅内部」，不会出现在 /v1/models 里。' : ''}
     </div>
     <div class="scroll"><table>

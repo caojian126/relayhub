@@ -7,6 +7,7 @@
       普通请求 / 流式请求 / 故障切换 / 不可重试错误 / 流式断流 /
       /v1/models 只露统一模型 / 导出安全与完整 / 导入合并与覆盖
       调度台：站点顺序 + 整站每日总次数
+      额度查询：路径回退 / 占位大数不当余额
 """
 
 import json
@@ -523,6 +524,40 @@ def main():
     check("清掉临时站后只剩 A 站", st == 200 and [s["name"] for s in sch] == ["A站"],
           [s["name"] for s in sch] if st == 200 else st)
     check("没设过上限的站默认按不限处理", all(s["daily_limit"] == 0 for s in sch))
+
+    print("\n=== 19. 额度查询：路径回退 / 占位大数不当余额 ===", flush=True)
+
+    st, r = admin(f"/sites/{site_id_of('A站')}/quota", "POST")
+    check("A站额度查询成功", st == 200 and r.get("known") == 1, r)
+    check("A站走裸路径 /dashboard/billing/* 也能查到（/v1 前缀 404 会回退）",
+          r.get("limit") == 100.0 and r.get("used") == 25.0 and r.get("remaining") == 75.0, r)
+    check("A站取了 hard_limit_usd", r.get("source") == "hard_limit_usd", r.get("source"))
+    check("A站没有多余的提示", not (r.get("note") or ""), r.get("note"))
+    check("A站原始返回留档", "billing_subscription" in (r.get("raw") or ""),
+          (r.get("raw") or "")[:100])
+
+    st, r = admin("/sites", "POST",
+                  {"name": "额度站", "base_url": MOCK_B, "api_key": "sk-mock-key-123456"})
+    check("新增一个「把不限写成一个亿」的站", st == 200 and r.get("id"), r)
+    qid = r.get("id")
+
+    st, r = admin(f"/sites/{qid}/quota", "POST")
+    check("B站能查到返回（只挂 /v1 前缀）", st == 200 and r.get("raw"), r)
+    check("占位大数不再被当成真余额", r.get("limit") is None and r.get("remaining") is None, r)
+    check("B站给了「占位值」提示", "占位" in (r.get("note") or ""), r.get("note"))
+    check("B站原始返回留档（方便排查真实结构）",
+          "100000000" in (r.get("raw") or ""), (r.get("raw") or "")[:120])
+
+    st, sites = admin("/sites")
+    qrow = [s for s in sites if s["id"] == qid][0]
+    check("站点列表带回 quota_note", "占位" in (qrow.get("quota_note") or ""),
+          qrow.get("quota_note"))
+    check("站点列表仍不泄露 api_key", "api_key" not in qrow, sorted(qrow.keys()))
+
+    admin(f"/sites/{qid}", "DELETE")
+    st, sites = admin("/sites")
+    check("清掉额度测试站后只剩 A 站", st == 200 and [s["name"] for s in sites] == ["A站"],
+          [s["name"] for s in sites] if st == 200 else st)
 
     print("\n" + "=" * 56, flush=True)
     if FAILED:

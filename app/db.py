@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS sites (
   quota_limit       REAL,
   quota_raw         TEXT    NOT NULL DEFAULT '',
   quota_error       TEXT    NOT NULL DEFAULT '',
+  quota_note        TEXT    NOT NULL DEFAULT '',
   quota_checked_at  REAL    NOT NULL DEFAULT 0,
   created_at        REAL    NOT NULL
 );
@@ -143,7 +144,10 @@ CREATE INDEX IF NOT EXISTS idx_cache_exp  ON cache_entries(expires_at);
 """
 
 DEFAULT_SETTINGS = {
-    "strategy": "balanced",             # balanced | priority | round_robin
+    # 默认「按用户排的顺序」。理由：各站额度字段的单位和真伪都很不可靠
+    # （见 quota.py：很多站把「不限」写成一个亿的占位值），拿余额当默认
+    # 排序依据会把顺序搞乱。想按余额排的人去「设置」或「顺序」页自己切。
+    "strategy": "priority",             # priority | balanced | round_robin
     "max_attempts": 3,                  # 单次请求最多尝试几个上游
     "circuit_threshold": 3,             # 连续失败几次触发熔断
     "circuit_cooldown": 600,            # 熔断冷却秒数
@@ -168,6 +172,8 @@ MIGRATIONS = {
     "sites": {
         # 「一个站一天总共能用几次」：跨该站所有统一模型累加。0 = 不限。
         "daily_limit": "INTEGER NOT NULL DEFAULT 0",
+        # 额度查询的提示语（占位值 / 只返回了系统级上限 之类）
+        "quota_note": "TEXT NOT NULL DEFAULT ''",
     },
     "request_logs": {
         "cached": "INTEGER NOT NULL DEFAULT 0",

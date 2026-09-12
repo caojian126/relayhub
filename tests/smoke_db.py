@@ -76,6 +76,7 @@ assert {"cached", "endpoint", "switches", "stream_phase"} <= lcols, \
 
 scols = {r["name"] for r in db.query("PRAGMA table_info(sites)")}
 assert "daily_limit" in scols, f"sites 缺列: {sorted(scols)}"
+assert "quota_note" in scols, f"sites 缺列: {sorted(scols)}"
 
 # 2. 数据不丢
 sites = db.query("SELECT * FROM sites")

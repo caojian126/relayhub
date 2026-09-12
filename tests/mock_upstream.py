@@ -8,6 +8,9 @@
   X-fail-400     永远 400 参数错误          -> 不该切节点，错误原样回给客户端（不可重试）
   X-stream-break 流式吐 2 个 chunk 后粗暴断开 -> 应该「不重试、不切换」
 
+额度接口也故意分了两种形态（见 quota.py 的注释）：
+  8101 标准美元额度 + 只挂裸路径；8102 把「不限」写成一个亿的占位值。
+
 回答正文里带端口号，方便确认到底是哪个站点接的。
 """
 
@@ -47,6 +50,40 @@ async def models(request: Request):
     if not auth.lower().startswith("bearer ") or len(auth) < 12:
         return _err(401, "missing or bad api key", "invalid_api_key")
     return {"object": "list", "data": [{"id": m, "object": "model"} for m in MODELS]}
+
+
+# ---- 额度接口 ----------------------------------------------------------
+# 故意做成两种形态，覆盖 quota.py 的几个分支：
+#
+#   8101（A站）：标准 new-api 形态，真实美元额度；而且「只挂裸路径」，
+#                用来验证 /v1 前缀 404 时能退回 /dashboard/billing/*。
+#   8102（B站）：把「不限」写成一个亿的占位值，而且不提供 usage，
+#                用来验证这种数不会被当成真实余额（以前会显示「剩余 1 亿」）。
+
+@app.get("/dashboard/billing/subscription")
+async def billing_subscription_bare(request: Request):
+    if PORT == 8101:
+        return {"object": "billing_subscription", "has_payment_method": True,
+                "soft_limit_usd": 100.0, "hard_limit_usd": 100.0,
+                "system_hard_limit_usd": 3000.0, "access_until": 4102444800}
+    return _err(404, "not found", "not_found")
+
+
+@app.get("/v1/dashboard/billing/subscription")
+async def billing_subscription_v1(request: Request):
+    if PORT == 8102:
+        return {"object": "billing_subscription", "has_payment_method": True,
+                "soft_limit_usd": 100000000, "hard_limit_usd": 100000000,
+                "system_hard_limit_usd": 100000000, "access_until": 4102444800}
+    return _err(404, "not found", "not_found")
+
+
+@app.get("/dashboard/billing/usage")
+@app.get("/v1/dashboard/billing/usage")
+async def billing_usage(request: Request):
+    if PORT == 8101:
+        return {"object": "list", "total_usage": 2500.0}   # 2500 * 0.01 = $25
+    return _err(404, "usage not supported", "not_found")
 
 
 def _chunk(model, text):
