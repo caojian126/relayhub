@@ -189,6 +189,9 @@ footer b{color:var(--ink-2)}
 .noderow{cursor:grab}
 .noderow.dragging{opacity:.4}
 .noderow .drag{color:var(--ink-3);font-size:15px;letter-spacing:1px;user-select:none;width:24px}
+.schedbar{height:7px;border-radius:999px;background:rgba(139,144,168,.18);overflow:hidden;margin-top:6px;min-width:90px}
+.schedbar>i{display:block;height:100%;border-radius:999px;background:var(--grad)}
+.schedbar.over>i{background:linear-gradient(135deg,#e05560,#c93a44)}
 .chat-box{display:flex;flex-direction:column;gap:12px;min-height:200px;max-height:50vh;overflow-y:auto;padding:4px 2px}
 .msg{max-width:80%;padding:11px 15px;border-radius:16px;font-size:13.5px;line-height:1.7;
   white-space:pre-wrap;word-break:break-word}
@@ -236,6 +239,7 @@ footer b{color:var(--ink-2)}
       <button data-tab="sites">站点</button>
       <button data-tab="models">模型</button>
       <button data-tab="groups">统一模型</button>
+      <button data-tab="schedule">顺序</button>
       <button data-tab="chat">测试</button>
       <button data-tab="keys">密钥</button>
       <button data-tab="logs">日志</button>
@@ -246,6 +250,7 @@ footer b{color:var(--ink-2)}
       <section id="tab-sites"></section>
       <section id="tab-models"></section>
       <section id="tab-groups"></section>
+      <section id="tab-schedule"></section>
       <section id="tab-chat"></section>
       <section id="tab-keys"></section>
       <section id="tab-logs"></section>
@@ -408,7 +413,7 @@ RENDER.sites = async function () {
         <td><b>${esc(s.name)}</b>${s.note ? `<br><span class="muted">${esc(s.note)}</span>` : ''}</td>
         <td class="mono">${esc(s.base_url)}</td>
         <td class="mono">${esc(s.api_key_masked) || '<span class="muted">未设</span>'}</td>
-        <td>${s.priority}</td><td>${st}</td><td>${s.today_total}</td><td>${q}</td>
+        <td>${st}</td><td>${s.today_total}</td><td>${q}</td>
         <td class="muted nowrap">${fmtTime(s.quota_checked_at)}</td>
         <td class="nowrap">
           <button class="sm" onclick="editSite(${s.id})">编辑</button>
@@ -426,7 +431,6 @@ RENDER.sites = async function () {
           <div><label>API Key</label><input id="s-key" placeholder="sk-...（编辑时留空表示不修改）"></div>
         </div>
         <div class="row gap">
-          <div style="max-width:180px"><label>优先级（数字越小越优先）</label><input id="s-pri" type="number" value="100"></div>
           <div style="max-width:150px"><label>启用</label><select id="s-enabled"><option value="1">是</option><option value="0">否</option></select></div>
           <div><label>备注</label><input id="s-note"></div>
         </div>
@@ -439,8 +443,8 @@ RENDER.sites = async function () {
         <div class="card-head"><h2>站点列表（${SITES.length}）</h2></div>
         <div class="note" style="margin-bottom:12px">各站的 API Key 保存在持久卷的数据库里，不经过环境变量。</div>
         <div class="scroll"><table>
-          <thead><tr><th>名称</th><th>地址</th><th>Key</th><th>优先级</th><th>状态</th><th>今日</th><th>剩余</th><th>额度查询</th><th>操作</th></tr></thead>
-          <tbody>${rows || '<tr><td colspan="9" class="empty">还没有站点</td></tr>'}</tbody>
+          <thead><tr><th>名称</th><th>地址</th><th>Key</th><th>状态</th><th>今日</th><th>剩余</th><th>额度查询</th><th>操作</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="8" class="empty">还没有站点</td></tr>'}</tbody>
         </table></div>
       </div>`;
   } catch (e) { el.innerHTML = `<div class="card glass empty">加载失败：${esc(e.message)}</div>`; }
@@ -449,7 +453,7 @@ RENDER.sites = async function () {
 function cancelSite() {
   EDIT_SITE = null;
   ['s-name', 's-url', 's-key', 's-note'].forEach(i => $('#' + i).value = '');
-  $('#s-pri').value = 100; $('#s-enabled').value = '1';
+  $('#s-enabled').value = '1';
   $('#site-form-title').textContent = '新增站点';
   $('#s-cancel').hidden = true;
 }
@@ -458,7 +462,7 @@ function editSite(id) {
   const s = SITES.find(x => x.id === id); if (!s) return;
   EDIT_SITE = id;
   $('#s-name').value = s.name; $('#s-url').value = s.base_url; $('#s-key').value = '';
-  $('#s-pri').value = s.priority; $('#s-enabled').value = s.enabled ? '1' : '0';
+  $('#s-enabled').value = s.enabled ? '1' : '0';
   $('#s-note').value = s.note || '';
   $('#site-form-title').textContent = '编辑站点 #' + id;
   $('#s-cancel').hidden = false;
@@ -468,7 +472,7 @@ function editSite(id) {
 async function saveSite() {
   const payload = {
     name: $('#s-name').value.trim(), base_url: $('#s-url').value.trim(),
-    api_key: $('#s-key').value.trim(), priority: parseInt($('#s-pri').value || '100', 10),
+    api_key: $('#s-key').value.trim(),
     enabled: $('#s-enabled').value === '1', note: $('#s-note').value.trim()
   };
   if (!payload.name || !payload.base_url) return toast('名称和地址必填', 'err');
@@ -959,10 +963,10 @@ RENDER.settings = async function () {
     el.innerHTML = `
       <div class="card glass"><h2>路由策略</h2>
         <div class="row">
-          <div><label>策略</label><select id="st-strategy">
-            <option value="balanced" ${s.strategy === 'balanced' ? 'selected' : ''}>balanced — 按剩余额度加权（推荐）</option>
-            <option value="priority" ${s.strategy === 'priority' ? 'selected' : ''}>priority — 固定优先级，第一个可用就一直用</option>
-            <option value="round_robin" ${s.strategy === 'round_robin' ? 'selected' : ''}>round_robin — 轮流使用，平均消耗</option>
+          <div><label>调度方式（推荐在「顺序」页设置）</label><select id="st-strategy">
+            <option value="priority" ${s.strategy === 'priority' ? 'selected' : ''}>按我排的顺序 — 从上往下依次试</option>
+            <option value="round_robin" ${s.strategy === 'round_robin' ? 'selected' : ''}>轮流用 — 谁今天用得少先给谁</option>
+            <option value="balanced" ${s.strategy === 'balanced' ? 'selected' : ''}>谁剩余额度多用谁 — 顺序只在余额相同时起作用</option>
           </select></div>
           <div style="max-width:200px"><label>单请求最多尝试几个上游</label><input id="st-max" type="number" value="${s.max_attempts}"></div>
         </div>
@@ -1659,6 +1663,149 @@ async function commitOrder(tbody) {
     toast('顺序已保存', 'ok');
     await drawGroupSheet();
   } catch (e) { toast(e.message, 'err'); }
+}
+
+/* ============ 顺序：站点调度台 ============ */
+/* 这一页只有一个目的：让「先走哪个站」和「每个站一天能用几次」一眼看懂。
+   顺序 = sites.priority（拖出来，10/20/30...）；次数 = sites.daily_limit（0 = 不限）。
+   站点编辑弹窗里那个「优先级」数字框已经拿掉了，免得两个地方打架。 */
+
+let SCHED_STRATEGY = 'balanced';
+const SCHED_LABEL = { priority: '按我排的顺序', round_robin: '轮流用', balanced: '谁剩余额度多用谁' };
+
+RENDER.schedule = async function () {
+  const el = $('#tab-schedule');
+  try {
+    const rows = await api('/schedule');
+    SCHED_STRATEGY = (await api('/settings')).strategy || 'balanced';
+    const chips = [['priority', '按我排的顺序'], ['round_robin', '轮流用'], ['balanced', '谁剩余额度多用谁']]
+      .map(([v, label]) =>
+        `<label class="model ${SCHED_STRATEGY === v ? 'on' : ''}" data-st="${v}">
+          <input type="radio" name="sched-st" value="${v}" ${SCHED_STRATEGY === v ? 'checked' : ''}
+            onchange="setSchedStrategy('${v}')"> ${label}</label>`).join('');
+    el.innerHTML = `
+      <div class="card glass">
+        <div class="card-head"><h2>站点调用顺序</h2></div>
+        <div class="note" style="margin-bottom:14px">
+          按住左边的 <b>≡</b> 上下拖动，越靠上越优先。松手就存，没有「保存」按钮。<br>
+          这个顺序是<b>全局</b>的：所有统一模型都按它挑站（在「统一模型」里单独拖过顺序的那个模型除外）。
+        </div>
+        <label>调度方式</label>
+        <div class="models" id="sched-strategy">${chips}</div>
+        <div class="note" id="sched-hint" style="margin-top:10px"></div>
+        <div class="scroll" style="margin-top:14px"><table>
+          <thead><tr><th></th><th>序</th><th>站点</th><th>状态</th>
+            <th style="min-width:170px">今日已用</th><th>每天总次数</th></tr></thead>
+          <tbody id="sched-body">${schedRows(rows)}</tbody>
+        </table></div>
+        <div class="note" style="margin-top:12px">
+          「每天总次数」是<b>整个站</b>一天总共的调用上限，跨它下面所有统一模型累加。
+          留空 = 不限。用满了就自动跳过这个站，等第二天（按 <code>TZ</code> 时区）重置。
+        </div>
+      </div>`;
+    drawSchedHint();
+    schedDrag($('#sched-body'));
+  } catch (e) { el.innerHTML = `<div class="card glass empty">加载失败：${esc(e.message)}</div>`; }
+};
+
+function schedRows(rows) {
+  if (!rows.length) return '<tr><td colspan="6" class="empty">还没有站点，先去「站点」页加一个</td></tr>';
+  return rows.map(s => {
+    const st = !s.enabled ? '<span class="tag dim">停用</span>'
+      : s.circuit_active ? '<span class="tag err">熔断</span>' : '<span class="tag ok">正常</span>';
+    const lim = s.daily_limit || 0;
+    const full = lim && s.today_total >= lim;
+    const bar = lim
+      ? `<div class="schedbar ${full ? 'over' : ''}"><i style="width:${Math.min(100, Math.round(s.today_total / lim * 100))}%"></i></div>`
+      : '';
+    return `<tr class="noderow" data-id="${s.id}">
+      <td class="drag" title="按住上下拖动排序">≡</td>
+      <td class="mono">${s.rank}</td>
+      <td><b>${esc(s.name)}</b>${s.note ? `<br><span class="muted">${esc(s.note)}</span>` : ''}</td>
+      <td>${st}</td>
+      <td>${lim ? `${s.today_total} / ${lim}` : `${s.today_total} / 不限`}${bar}</td>
+      <td><input type="number" min="0" placeholder="不限" style="max-width:110px"
+        value="${lim || ''}" onchange="saveSchedLimit(${s.id}, this)"></td>
+    </tr>`;
+  }).join('');
+}
+
+function drawSchedHint() {
+  const h = $('#sched-hint');
+  if (!h) return;
+  if (SCHED_STRATEGY === 'priority') {
+    h.innerHTML = '当前方式：<b>严格按你排的顺序</b>从上往下试，第一个能用的就一直用它。';
+  } else if (SCHED_STRATEGY === 'round_robin') {
+    h.innerHTML = '当前方式：<b>轮流用</b>，谁今天用得少先给谁。你排的顺序只在用量相同时才起作用。';
+  } else {
+    h.innerHTML = '当前方式：<b>谁剩余额度多用谁</b>。上游余额多的站会被优先选中，'
+      + '你排的顺序<b>只在余额相同时才起作用</b>。想让顺序说了算 —— '
+      + `<a href="javascript:setSchedStrategy('priority')">点这里切成「按我排的顺序」</a>。`;
+  }
+}
+
+async function setSchedStrategy(v) {
+  try {
+    await api('/settings', { method: 'PUT', body: JSON.stringify({ strategy: v }) });
+    toast('调度方式已切成「' + (SCHED_LABEL[v] || v) + '」', 'ok');
+    RENDER.schedule();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function saveSchedLimit(id, input) {
+  const raw = (input.value || '').trim();
+  const lim = raw === '' ? 0 : Math.max(0, parseInt(raw, 10) || 0);
+  try {
+    await api('/schedule/limits', { method: 'POST', body: JSON.stringify({ items: [{ id, daily_limit: lim }] }) });
+    toast(lim ? `已设为每天最多 ${lim} 次` : '已设为不限', 'ok');
+    RENDER.schedule();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function saveSchedOrder(ids) {
+  try {
+    await api('/schedule/order', { method: 'POST', body: JSON.stringify({ ids }) });
+    toast('顺序已保存', 'ok');
+    RENDER.schedule();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+function schedDrag(tbody) {
+  if (!tbody) return;
+  const rowsOf = () => $$('.noderow', tbody);
+  let dragging = null;
+  rowsOf().forEach(tr => {
+    // 只有 ≡ 那一格可拖 —— 否则右边那个数字框没法用鼠标选中输入。
+    const handle = $('.drag', tr) || tr;
+    handle.draggable = true;
+    handle.ondragstart = e => {
+      dragging = tr;
+      tr.classList.add('dragging');
+      // Firefox 里 dragstart 不 setData 的话，拖动根本不会开始。
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', String(tr.dataset.id));
+      }
+    };
+    tr.ondragover = e => {
+      e.preventDefault();
+      if (!dragging || dragging === tr) return;
+      const r = tr.getBoundingClientRect();
+      const after = (e.clientY - r.top) / r.height > 0.5;
+      tbody.insertBefore(dragging, after ? tr.nextSibling : tr);
+    };
+    handle.ondragend = () => {
+      tr.classList.remove('dragging');
+      if (!dragging) return;
+      dragging = null;
+      const ids = rowsOf().map(x => parseInt(x.dataset.id, 10));
+      const key = ids.join(',');
+      if (key === (tbody.dataset.order || '')) return;   // 位置没变就别弹「已保存」
+      tbody.dataset.order = key;
+      saveSchedOrder(ids);
+    };
+  });
+  tbody.dataset.order = rowsOf().map(x => x.dataset.id).join(',');
 }
 
 /* ============ 聊天测试（真的走本机网关） ============ */

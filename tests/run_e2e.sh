@@ -58,6 +58,11 @@ wait_up "http://127.0.0.1:$RH_PORT/healthz" 25 || {
   echo "RelayHub 起不来，日志："; tail -30 "$LOG/relayhub.log"; exit 1; }
 
 echo
+echo "==> 前端 JS 静态检查（不需要浏览器）"
+"$PY" tests/js_check.py
+JSRC=$?
+
+echo
 "$PY" tests/e2e.py
 RC=$?
 
@@ -89,10 +94,10 @@ PY
 PRC=$?
 
 echo
-if [ "$RC" -eq 0 ] && [ "$PRC" -eq 0 ]; then
+if [ "$RC" -eq 0 ] && [ "$PRC" -eq 0 ] && [ "$JSRC" -eq 0 ]; then
   echo "全部通过 ✅"
 else
-  echo "有失败项（e2e=$RC 持久化=$PRC）❌"
+  echo "有失败项（js=$JSRC e2e=$RC 持久化=$PRC）❌"
   echo "日志目录：$LOG"
 fi
-exit $(( RC + PRC ))
+exit $(( JSRC + RC + PRC ))
