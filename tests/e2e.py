@@ -477,6 +477,16 @@ def main():
     st, sch3 = admin("/schedule")
     check("顺序可还原", [s["id"] for s in sch3] == order, [s["name"] for s in sch3])
 
+    # 点箭头 = 只交换相邻两个（前端 moveSched 就是这么算的）
+    if len(order) >= 2:
+        swapped = list(order)
+        swapped[0], swapped[1] = swapped[1], swapped[0]
+        admin("/schedule/order", "POST", {"ids": swapped})
+        st, sch4 = admin("/schedule")
+        check("单步换位（点 ↑↓）能生效", [s["id"] for s in sch4] == swapped,
+              [s["name"] for s in sch4])
+        admin("/schedule/order", "POST", {"ids": order})
+
     # ---- 整站每日总次数：真的会挡住请求
     admin("/groups", "POST", {"name": "qcap", "strategy": "priority"})
     st, r = admin("/groups/qcap/nodes", "POST",

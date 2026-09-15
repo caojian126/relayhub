@@ -62,6 +62,7 @@ button.ghost{background:transparent;box-shadow:none;border-color:var(--line)}
 button.danger{color:var(--err)}
 button.sm{padding:5px 12px;font-size:12.5px}
 button:disabled{opacity:.45;cursor:not-allowed;transform:none}
+.arrowbtn{padding:7px 0;width:38px;font-size:15px;line-height:1;font-weight:600}
 input,select,textarea{
   font:inherit;width:100%;color:var(--ink);
   padding:10px 14px;border-radius:14px;
@@ -1717,7 +1718,8 @@ RENDER.schedule = async function () {
       <div class="card glass">
         <div class="card-head"><h2>站点调用顺序</h2></div>
         <div class="note" style="margin-bottom:14px">
-          按住左边的 <b>≡</b> 上下拖动，越靠上越优先。松手就存，没有「保存」按钮。<br>
+          越靠上越优先。两种排法都行：<b>点右边的 ↑ ↓</b>（手机推荐，不会碰到系统手势），
+          或者按住 <b>≡</b> 上下拖动。点完/松手立刻保存，没有「保存」按钮。<br>
           这个顺序是<b>全局</b>的：所有统一模型都按它挑站（在「统一模型」里单独拖过顺序的那个模型除外）。
         </div>
         <label>调度方式</label>
@@ -1725,7 +1727,7 @@ RENDER.schedule = async function () {
         <div class="note" id="sched-hint" style="margin-top:10px"></div>
         <div class="scroll" style="margin-top:14px"><table>
           <thead><tr><th></th><th>序</th><th>站点</th><th>状态</th>
-            <th style="min-width:170px">今日已用</th><th>每天总次数</th></tr></thead>
+            <th style="min-width:170px">今日已用</th><th>每天总次数</th><th>上移/下移</th></tr></thead>
           <tbody id="sched-body">${schedRows(rows)}</tbody>
         </table></div>
         <div class="note" style="margin-top:12px">
@@ -1739,8 +1741,8 @@ RENDER.schedule = async function () {
 };
 
 function schedRows(rows) {
-  if (!rows.length) return '<tr><td colspan="6" class="empty">还没有站点，先去「站点」页加一个</td></tr>';
-  return rows.map(s => {
+  if (!rows.length) return '<tr><td colspan="7" class="empty">还没有站点，先去「站点」页加一个</td></tr>';
+  return rows.map((s, i) => {
     const st = !s.enabled ? '<span class="tag dim">停用</span>'
       : s.circuit_active ? '<span class="tag err">熔断</span>' : '<span class="tag ok">正常</span>';
     const lim = s.daily_limit || 0;
@@ -1756,6 +1758,12 @@ function schedRows(rows) {
       <td>${lim ? `${s.today_total} / ${lim}` : `${s.today_total} / 不限`}${bar}</td>
       <td><input type="number" min="0" placeholder="不限" style="max-width:110px"
         value="${lim || ''}" onchange="saveSchedLimit(${s.id}, this)"></td>
+      <td class="nowrap">
+        <button class="sm arrowbtn" title="上移一位" ${i === 0 ? 'disabled' : ''}
+          onclick="moveSched(${s.id}, -1)">↑</button>
+        <button class="sm arrowbtn" title="下移一位" ${i === rows.length - 1 ? 'disabled' : ''}
+          onclick="moveSched(${s.id}, 1)">↓</button>
+      </td>
     </tr>`;
   }).join('');
 }
@@ -1789,6 +1797,19 @@ async function saveSchedLimit(id, input) {
     await api('/schedule/limits', { method: 'POST', body: JSON.stringify({ items: [{ id, daily_limit: lim }] }) });
     toast(lim ? `已设为每天最多 ${lim} 次` : '已设为不限', 'ok');
     RENDER.schedule();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+/* 点箭头换位。不依赖拖拽 —— 手机上长按拖动常被系统手势（任意门之类）抢走。 */
+async function moveSched(id, delta) {
+  const ids = $$('#sched-body .noderow').map(x => parseInt(x.dataset.id, 10));
+  const i = ids.indexOf(id);
+  const j = i + delta;
+  if (i < 0 || j < 0 || j >= ids.length) return;
+  [ids[i], ids[j]] = [ids[j], ids[i]];
+  try {
+    await api('/schedule/order', { method: 'POST', body: JSON.stringify({ ids }) });
+    RENDER.schedule();   // 重渲染，rank 和箭头的禁用状态跟着更新
   } catch (e) { toast(e.message, 'err'); }
 }
 
