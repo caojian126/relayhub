@@ -15,7 +15,7 @@ from .config import CONNECT_TIMEOUT, REQUEST_TIMEOUT, persistence_report
 from .db import DEFAULT_SETTINGS
 
 STATIC_DIR = Path(__file__).parent / "static"
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 SSE_HEADERS = {
     "Cache-Control": "no-cache",
